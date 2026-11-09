@@ -41,7 +41,7 @@ __name__ = "RichFrog Lite"
 __description__ = "Визуальный NFT-профиль и синхронизация RichFrog между пользователями."
 __category__ = ["chats", "tools"]
 __author__ = "@Meapia"
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.4.3"
 __icon__ = "FrogCaseBot/1"
