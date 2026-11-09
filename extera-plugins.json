@@ -14,14 +14,14 @@
         "tools"
       ],
       "author": "@Meapia",
-      "version": "1.2.0",
+      "version": "1.2.1",
       "app_version": ">=12.5.1",
       "sdk_version": ">=1.4.4.3",
       "icon": "FrogCaseBot/1",
       "file": "plugins/RichFrog_Lite.plugin",
-      "sha256": "dc7b72884fc88b405852e23fa4b351415254817bb79a33a7d2ae9385b671e30a",
+      "sha256": "ac1de5e473c7f371d518cfb528931ef0ff02d3e0801b9fced8a663c9ea0bbedb",
       "size": 200042,
-      "updated_at": "2026-11-09T14:00:21Z"
+      "updated_at": "2026-11-09T14:01:08Z"
     }
   ]
 }
