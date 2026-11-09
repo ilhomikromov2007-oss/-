@@ -7,6 +7,8 @@ import random
 import time
 import math
 import traceback
+import urllib.request
+import urllib.error
 
 from typing import Any, Dict
 
@@ -36,10 +38,10 @@ from android.view.animation import DecelerateInterpolator, OvershootInterpolator
 
 __id__ = "RichFrog_Lite"
 __name__ = "RichFrog Lite"
-__description__ = "Облегчённая версия RichFrog: без глобального перехвата сетевых запросов и фонового прогрева."
+__description__ = "Визуальный NFT-профиль и синхронизация RichFrog между пользователями."
 __category__ = ["chats", "tools"]
 __author__ = "@Meapia"
-__version__ = "1.1.2"
+__version__ = "1.2.0"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.4.3"
 __icon__ = "FrogCaseBot/1"
@@ -1268,9 +1270,9 @@ class GetUserFullHook(MethodHook):
             if not self.plugin.acc_enabled():
                 return
             full = param.getResult()
-            if full is None or int(param.args[0]) != my_id():
-                return
-            self.plugin.apply_rating(full)
+            if full is None: return
+            if int(param.args[0]) == my_id(): self.plugin.apply_rating(full)
+            else: self.plugin.sync_remote_rating(full)
         except Exception as e:
             log("RichFrog getUserFull error: " + str(e))
 
@@ -1304,8 +1306,8 @@ class UserFullArgHook(MethodHook):
                 if arg is None or not hasattr(arg, "stars_rating"):
                     continue
                 try:
-                    if int(arg.id) == my_id():
-                        self.plugin.apply_rating(arg)
+                    if int(arg.id) == my_id(): self.plugin.apply_rating(arg)
+                    else: self.plugin.sync_remote_rating(arg)
                 except Exception:
                     continue
         except Exception as e:
@@ -1716,8 +1718,12 @@ class RichFrogLitePlugin(BasePlugin):
                     log("RichFrog skip hook %s: %s" % (name, e))
         except Exception as e:
             log("RichFrog put user hooks: " + str(e))
+        self._remote_profiles = {}
+        self._remote_pending = set()
         self._maybe_auto_restore()
         self._refresh_flags()
+        if bool(self.get_setting("sync_enabled", False)):
+            threading.Thread(target=self.sync_register_publish, daemon=True).start()
         self._refresh_worn_flag()
         self._warmup_gifts()
         log("RichFrog loaded")
@@ -1776,6 +1782,75 @@ class RichFrogLitePlugin(BasePlugin):
             return my_id()
         except Exception:
             return 0
+
+    SYNC_API = "https://richfrog-sync.onrender.com"
+
+    def sync_http(self, path, method="GET", data=None, token=""):
+        body = json.dumps(data or {}, ensure_ascii=False).encode("utf-8") if data is not None else None
+        req = urllib.request.Request(self.SYNC_API + path, data=body, method=method)
+        req.add_header("Accept", "application/json")
+        if body is not None: req.add_header("Content-Type", "application/json; charset=utf-8")
+        if token: req.add_header("Authorization", "Bearer " + token)
+        with urllib.request.urlopen(req, timeout=12) as response:
+            raw = response.read(65536)
+            return json.loads(raw.decode("utf-8")) if raw else {}
+
+    def sync_register_publish(self):
+        uid = self.uid()
+        if not uid or not bool(self.get_setting("sync_enabled", False)): return
+        token_key = "sync_device_token_%d" % uid
+        token = str(self.get_setting(token_key, "") or "")
+        if not token:
+            try:
+                result = self.sync_http("/v1/register", "POST", {"telegram_id": uid})
+                token = str(result.get("device_token", "") or "")
+                if token: self.set_setting(token_key, token)
+            except Exception as e:
+                log("RichFrog sync register: " + str(e))
+                return
+        if token:
+            payload = {}
+            if self.acc_enabled(): payload["rating"] = {"level": self.get_level(), "points": self.get_points()}
+            active = self.uname_active() if self.uname_show() else ""
+            if active and self.find_username(active): payload["username_labels"] = [active]
+            try: self.sync_http("/v1/profile/%d" % uid, "PUT", {"payload": payload, "public": True}, token)
+            except Exception as e: log("RichFrog sync publish: " + str(e))
+
+    def sync_remote_rating(self, full):
+        try:
+            target = int(getattr(full, "id", 0) or 0)
+            if not target or target == self.uid() or not bool(self.get_setting("sync_enabled", False)): return
+            cache = getattr(self, "_remote_profiles", {})
+            item = cache.get(target)
+            if item is None or time.time() - item.get("_at", 0) > 45:
+                if target not in self._remote_pending:
+                    self._remote_pending.add(target)
+                    def job():
+                        try:
+                            data = self.sync_http("/v1/profile/%d" % target)
+                            data["_at"] = time.time()
+                            self._remote_profiles[target] = data
+                        except Exception: pass
+                        finally: self._remote_pending.discard(target)
+                    threading.Thread(target=job, daemon=True).start()
+                return
+            data = (item.get("payload") or {}).get("rating")
+            if not isinstance(data, dict): return
+            level = min(MAX_LEVEL, max(1, to_int(data.get("level"), 1)))
+            points = max(0, to_int(data.get("points"), 0))
+            rating = getattr(full, "stars_rating", None)
+            if rating is None:
+                if self.rating_cls is None: self.rating_cls = self.discover_rating_class(full)
+                if self.rating_cls is None: return
+                rating = self.rating_cls()
+                full.stars_rating = rating
+            full.flags2 = full.flags2 | 131072
+            rating.flags = rating.flags | 1
+            rating.level = level
+            rating.stars = points
+            rating.current_level_stars = level_threshold(level)
+            rating.next_level_stars = level_threshold(level + 1)
+        except Exception as e: log("RichFrog remote rating: " + str(e))
 
     def _migrate(self):
         """Старые общие настройки (до 2.1) переезжают на текущий аккаунт один раз."""
@@ -4502,6 +4577,10 @@ class RichFrogLitePlugin(BasePlugin):
         except Exception:
             pass
         return [
+            Header(text="Синхронизация"),
+            Switch(key="sync_enabled", text="Общий визуальный профиль", default=False,
+                   subtext="Публикует рейтинг и NFT username. Telegram ID не подтверждается сервером."),
+            Divider(),
             Header(text="NFT-профиль"),
             Switch(key="enabled_%d" % uid, text="Подмена рейтинга", default=True,
                    subtext="Только для этого аккаунта · видно только тебе"),
