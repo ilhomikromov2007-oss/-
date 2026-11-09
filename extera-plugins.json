@@ -19,9 +19,9 @@
       "sdk_version": ">=1.4.4.3",
       "icon": "FrogCaseBot/1",
       "file": "plugins/RichFrog_Lite.plugin",
-      "sha256": "a5050a1f87a5b69d9cf9c608ee6a7fc3d9c4580a01e9a4b6682d499568b917ce",
-      "size": 199547,
-      "updated_at": "2026-11-09T13:42:53Z"
+      "sha256": "872bc93360118e5ceca62f6967b4a0b038e9258c7d22b423cbda027e9918e6c5",
+      "size": 199762,
+      "updated_at": "2026-11-09T13:43:09Z"
     }
   ]
 }
