@@ -18,7 +18,7 @@ REPOSITORY = {
     "author": "@ilhomikromov2007-oss",
     "homepage": "https://github.com/ilhomikromov2007-oss/-",
 }
-META_LINE = re.compile(r"^__(?P<key>[a-z_]+)__\\s*=\\s*(?P<value>.+?)\\s*$")
+META_LINE = re.compile(r"^__(?P<key>[a-z_]+)__\s*=\s*(?P<value>.+?)\s*$")
 
 
 def read_metadata(path):
@@ -61,7 +61,7 @@ def main():
         raise SystemExit("duplicate plugin ids")
 
     INDEX.write_text(
-        json.dumps({**REPOSITORY, "plugins": entries}, ensure_ascii=False, indent=2) + "\\n",
+        json.dumps({**REPOSITORY, "plugins": entries}, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
     print(f"Indexed {len(entries)} plugin(s)")
