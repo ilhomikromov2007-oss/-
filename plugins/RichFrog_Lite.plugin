@@ -37,6 +37,7 @@ from android.view.animation import DecelerateInterpolator, OvershootInterpolator
 __id__ = "RichFrog_Lite"
 __name__ = "RichFrog Lite"
 __description__ = "Облегчённая версия RichFrog: без глобального перехвата сетевых запросов и фонового прогрева."
+__category__ = ["chats", "tools"]
 __author__ = "@Meapia"
 __version__ = "1.1.2"
 __app_version__ = ">=12.5.1"
