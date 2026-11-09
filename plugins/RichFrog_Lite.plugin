@@ -1722,8 +1722,7 @@ class RichFrogLitePlugin(BasePlugin):
         self._remote_pending = set()
         self._maybe_auto_restore()
         self._refresh_flags()
-        if bool(self.get_setting("sync_enabled", False)):
-            threading.Thread(target=self.sync_register_publish, daemon=True).start()
+        threading.Thread(target=self.sync_register_publish, daemon=True).start()
         self._refresh_worn_flag()
         self._warmup_gifts()
         log("RichFrog loaded")
@@ -1797,7 +1796,7 @@ class RichFrogLitePlugin(BasePlugin):
 
     def sync_register_publish(self):
         uid = self.uid()
-        if not uid or not bool(self.get_setting("sync_enabled", False)): return
+        if not uid: return
         token_key = "sync_device_token_%d" % uid
         token = str(self.get_setting(token_key, "") or "")
         if not token:
@@ -1819,7 +1818,7 @@ class RichFrogLitePlugin(BasePlugin):
     def sync_remote_rating(self, full):
         try:
             target = int(getattr(full, "id", 0) or 0)
-            if not target or target == self.uid() or not bool(self.get_setting("sync_enabled", False)): return
+            if not target or target == self.uid(): return
             cache = getattr(self, "_remote_profiles", {})
             item = cache.get(target)
             if item is None or time.time() - item.get("_at", 0) > 45:
@@ -1880,11 +1879,10 @@ class RichFrogLitePlugin(BasePlugin):
         self._cfg_cache.clear()
         self._un_cache.clear()
         self._auto_backup()
-        if bool(self.get_setting("sync_enabled", False)):
-            try:
-                threading.Thread(target=self.sync_register_publish, daemon=True).start()
-            except Exception:
-                pass
+        try:
+            threading.Thread(target=self.sync_register_publish, daemon=True).start()
+        except Exception:
+            pass
 
     def acc_enabled(self):
         return bool(self.acc_get("enabled", True))
@@ -4582,10 +4580,6 @@ class RichFrogLitePlugin(BasePlugin):
         except Exception:
             pass
         return [
-            Header(text="Синхронизация"),
-            Switch(key="sync_enabled", text="Общий визуальный профиль", default=False,
-                   subtext="Публикует рейтинг и NFT username. Telegram ID не подтверждается сервером."),
-            Divider(),
             Header(text="NFT-профиль"),
             Switch(key="enabled_%d" % uid, text="Подмена рейтинга", default=True,
                    subtext="Только для этого аккаунта · видно только тебе"),
