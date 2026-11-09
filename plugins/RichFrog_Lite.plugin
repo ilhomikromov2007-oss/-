@@ -1880,6 +1880,11 @@ class RichFrogLitePlugin(BasePlugin):
         self._cfg_cache.clear()
         self._un_cache.clear()
         self._auto_backup()
+        if bool(self.get_setting("sync_enabled", False)):
+            try:
+                threading.Thread(target=self.sync_register_publish, daemon=True).start()
+            except Exception:
+                pass
 
     def acc_enabled(self):
         return bool(self.acc_get("enabled", True))
