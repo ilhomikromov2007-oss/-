@@ -2997,7 +2997,8 @@ class RichFrogLitePlugin(BasePlugin):
     # ==================================================================
     def sticker_view(self, ctx, doc, size_dp, tint=None, static=False):
         from org.telegram.ui.Components import BackupImageView
-        from org.telegram.messenger import ImageLocation        iv = BackupImageView(ctx)
+        from org.telegram.messenger import ImageLocation
+        iv = BackupImageView(ctx)
         if doc is None:
             return iv
         loc = ImageLocation.getForDocument(doc)
