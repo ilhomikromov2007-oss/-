@@ -1829,7 +1829,19 @@ class RichFrogLitePlugin(BasePlugin):
                             data = self.sync_http("/v1/profile/%d" % target)
                             data["_at"] = time.time()
                             self._remote_profiles[target] = data
-                        except Exception: pass
+                            # Reload full info after async fetch so the cached rating is applied.
+                            def refresh_remote():
+                                try:
+                                    from org.telegram.messenger import MessagesController, UserConfig
+                                    mc = MessagesController.getInstance(UserConfig.selectedAccount)
+                                    user = mc.getUser(target)
+                                    if user is not None:
+                                        mc.loadFullUser(user, 0, True)
+                                except Exception as e:
+                                    log("RichFrog remote profile refresh: " + str(e))
+                            run_on_ui_thread(refresh_remote)
+                        except Exception as e:
+                            log("RichFrog remote profile fetch: " + str(e))
                         finally: self._remote_pending.discard(target)
                     threading.Thread(target=job, daemon=True).start()
                 return
