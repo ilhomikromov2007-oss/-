@@ -1,0 +1,4540 @@
+import json
+import os
+import threading
+import re
+import base64
+import random
+import time
+import math
+import traceback
+
+from typing import Any, Dict
+
+from base_plugin import BasePlugin, MethodHook, HookResult, HookStrategy, MenuItemData, MenuItemType
+from ui.settings import Header, Switch, Text, Divider
+from hook_utils import find_class
+from android_utils import log, run_on_ui_thread
+from client_utils import get_last_fragment
+from java import jclass, dynamic_proxy, jarray, jint, jfloat
+
+try:
+    from java import cast
+except Exception:
+    cast = None
+
+from android.graphics import Paint, Path, PorterDuff, PorterDuffColorFilter, Typeface
+from android.graphics.drawable import GradientDrawable, ShapeDrawable, LayerDrawable, ClipDrawable, Drawable
+from android.graphics.drawable.shapes import PathShape
+from android.view import Gravity, View
+from android.widget import (
+    FrameLayout, LinearLayout, TextView, ImageView, ScrollView,
+    HorizontalScrollView, SeekBar, EditText,
+)
+from android.text import InputType
+from android.animation import ValueAnimator
+from android.view.animation import DecelerateInterpolator, OvershootInterpolator, AccelerateInterpolator, PathInterpolator
+
+__id__ = "RichFrog_Lite"
+__name__ = "RichFrog Lite"
+__description__ = "Облегчённая версия RichFrog: без глобального перехвата сетевых запросов и фонового прогрева."
+__author__ = "@Meapia"
+__version__ = "1.1.2"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+__icon__ = "FrogCaseBot/1"
+
+CONTACT_URL = "https://t.me/Meapia"
+TON_ADDRESS = "UQC5BhgSxBlbkJCnCi9Z_Qy8DQ0DPTL5HFTrGU1opQyx000D"
+TON_COMMENT = "Поддержка проекта"
+
+MAX_LEVEL = 100
+RATING_CLASSES = [
+    "org.telegram.tgnet.tl.TL_stars$TL_starsRating",
+    "org.telegram.tgnet.TLRPC$TL_starsRating",
+    "org.telegram.tgnet.tl.TL_stars$StarsRating",
+]
+TL_OUTERS = [
+    "org.telegram.tgnet.tl.TL_fragment",
+    "org.telegram.tgnet.tl.TL_stars",
+    "org.telegram.tgnet.tl.TL_payments",
+    "org.telegram.tgnet.TLRPC",
+]
+
+DEFAULT_ACCENT = 0xFFFF2D55 - (1 << 32)
+SHEET_SIDE = 10      # dp: отступ шторки от краёв экрана
+SHEET_BOTTOM = 16    # dp: шторка приподнята над низом, чтобы был виден её скруглённый низ
+WHITE_C = 0xFFFFFFFF - (1 << 32)
+TON_USD = 3.0   # условный курс для строки «≈ $» в инфо о юзернейме
+USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
+BACKUP_KEYS = ("level", "points", "enabled", "gifts_json", "gifts_enabled", "worn_id",
+               "usernames_json", "uname_active", "uname_show", "uname_replace",
+               "phones_json", "phone_active", "phone_show")
+
+
+# ======================================================================
+# Утилиты
+# ======================================================================
+_DENS = [None]
+
+
+def dp(v):
+    if _DENS[0] is None:
+        from org.telegram.messenger import AndroidUtilities
+        try:
+            _DENS[0] = float(AndroidUtilities.density)
+        except Exception:
+            _DENS[0] = float(AndroidUtilities.dp(1000.0)) / 1000.0
+    if v == 0:
+        return 0
+    return int(math.ceil(_DENS[0] * float(v)))
+
+
+def _ih(obj):
+    return int(jclass("java.lang.System").identityHashCode(obj))
+
+
+def clean_phone(s):
+    return "".join(ch for ch in str(s) if ch.isdigit())
+
+
+def fmt_phone(d):
+    d = clean_phone(d)
+    if d.startswith("888") and len(d) == 11:
+        return "+888 %s %s" % (d[3:7], d[7:11])
+    return "+" + d
+
+
+def to_int(value, default):
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return default
+
+
+def my_id():
+    from org.telegram.messenger import UserConfig
+    return int(UserConfig.getInstance(UserConfig.selectedAccount).getClientUserId())
+
+
+def java_abstract(cls):
+    try:
+        from java.lang.reflect import Modifier
+        return Modifier.isAbstract(cls.getModifiers())
+    except Exception:
+        return False
+
+
+def level_threshold(level):
+    """Очки, с которых начинается уровень. Кривая подогнана под данные Telegram:
+    72 ур. = 894.4K, 73 ур. = 907.6K. Поменяй под себя при необходимости."""
+    if level <= 1:
+        return 0
+    return int(round(9522.614 * (level ** 1.06216) / 100.0)) * 100
+
+
+def level_from_points(points):
+    level = 1
+    while level < MAX_LEVEL and level_threshold(level + 1) <= points:
+        level += 1
+    return level
+
+
+def fmt_k(n):
+    n = int(n)
+    if n >= 1000000:
+        s = "%.1f" % (n / 1000000.0)
+        suffix = "M"
+    elif n >= 1000:
+        s = "%.1f" % (n / 1000.0)
+        suffix = "K"
+    else:
+        return str(n)
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s + suffix
+
+
+def fmt_pct(permille):
+    try:
+        v = float(permille) / 10.0
+        return ("%g" % v) + "%"
+    except Exception:
+        return ""
+
+
+_DARK = [True]
+
+
+_ACC = [DEFAULT_ACCENT]
+
+
+def _over(base, ov):
+    """Альфа-композиция ov поверх base (ARGB)."""
+    b = int(base) & 0xFFFFFFFF
+    o = int(ov) & 0xFFFFFFFF
+    ba, oa = (b >> 24) / 255.0, (o >> 24) / 255.0
+    ra = oa + ba * (1.0 - oa)
+    if ra <= 0:
+        return 0
+
+    def ch(sh):
+        return int(round((((o >> sh) & 0xFF) * oa + ((b >> sh) & 0xFF) * ba * (1.0 - oa)) / ra))
+
+    return signed((int(round(ra * 255)) << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0))
+
+
+def _tint(c, alpha):
+    return signed((int(alpha) << 24) | (int(c) & 0xFFFFFF))
+
+
+def darken(c, f):
+    c = int(c) & 0xFFFFFFFF
+    r = int(((c >> 16) & 0xFF) * (1 - f))
+    g = int(((c >> 8) & 0xFF) * (1 - f))
+    b = int((c & 0xFF) * (1 - f))
+    return signed((0xFF << 24) | (r << 16) | (g << 8) | b)
+
+
+def lighten(c, f):
+    c = int(c) & 0xFFFFFFFF
+    a = (c >> 24) & 0xFF
+    r = (c >> 16) & 0xFF
+    g = (c >> 8) & 0xFF
+    b = c & 0xFF
+    r = int(r + (255 - r) * f)
+    g = int(g + (255 - g) * f)
+    b = int(b + (255 - b) * f)
+    return signed((a << 24) | (r << 16) | (g << 8) | b)
+
+
+def _orient(name):
+    try:
+        return getattr(GradientDrawable.Orientation, name)
+    except Exception:
+        return getattr(jclass("android.graphics.drawable.GradientDrawable$Orientation"), name)
+
+
+def _grad(colors, orient, radius_px=None, radii=None):
+    g = GradientDrawable()
+    g.setOrientation(_orient(orient))
+    g.setColors(jarray(jint)([signed(c) for c in colors]))
+    if radii is not None:
+        g.setCornerRadii(jarray(jfloat)([float(x) for x in radii]))
+    elif radius_px is not None:
+        g.setCornerRadius(float(radius_px))
+    return g
+
+
+def set_bg(view, drawable):
+    """setBackground, но без сброса паддингов (LayerDrawable меняет padding вью)."""
+    l, t, r, b = view.getPaddingLeft(), view.getPaddingTop(), view.getPaddingRight(), view.getPaddingBottom()
+    view.setBackground(drawable)
+    view.setPadding(l, t, r, b)
+
+
+# iOS «Liquid Glass» как на референсе: тонкая кромка, яркие углы, короткие «искры» по верхней и нижней грани
+BLUE = 0xFFEAEFF7   # акцент: холодный светло-серый
+
+
+def _with_alpha(c, a):
+    return signed((int(a) << 24) | (int(c) & 0xFFFFFF))
+
+
+def argb(a, r, g, b):
+    return signed((int(max(0, min(255, a))) << 24) | (int(max(0, min(255, r))) << 16)
+                  | (int(max(0, min(255, g))) << 8) | int(max(0, min(255, b))))
+
+
+def mix(a, b, t):
+    return a + (b - a) * max(0.0, min(1.0, t))
+
+
+def _backdrop_layer(bmp, W, H, radii):
+    """Слой «то, что за шторкой»: сильно размытый снимок экрана, подсвеченный; двигается вместе с шторкой."""
+    from android.graphics import BitmapShader, ColorMatrixColorFilter, Matrix, Shader
+    from android.graphics.drawable.shapes import RoundRectShape
+    shader = BitmapShader(bmp, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+    sd = ShapeDrawable(RoundRectShape(jarray(jfloat)([float(x) for x in radii]), None, None))
+    p = sd.getPaint()
+    p.setShader(shader)
+    p.setAntiAlias(True)
+    p.setFilterBitmap(True)
+    k = 2.7  # усиление: светлые места фона становятся заметно светлее, тёмные остаются тёмными
+    p.setColorFilter(ColorMatrixColorFilter(jarray(jfloat)([
+        k, 0, 0, 0, 0,
+        0, k, 0, 0, 0,
+        0, 0, k, 0, 0,
+        0, 0, 0, 1, 0])))
+    sd.setAlpha(135)
+    info = {"bd": sd, "shader": shader, "bw": int(bmp.getWidth()), "bh": int(bmp.getHeight()),
+            "W": float(W), "H": float(H)}
+    backdrop_move(info, float(H) * 0.5)
+    return sd, info
+
+
+def backdrop_move(info, sheet_top_px):
+    """Снимок фона стоит на месте, а окно шторки скользит по нему: свет внутри меняется по ходу движения."""
+    try:
+        from android.graphics import Matrix
+        m = Matrix()
+        m.setScale(info["W"] / info["bw"], info["H"] / info["bh"])
+        m.postTranslate(0.0, -float(sheet_top_px))
+        info["shader"].setLocalMatrix(m)
+        info["bd"].invalidateSelf()
+    except Exception as e:
+        log("RichFrog backdrop move: " + str(e))
+
+
+def _ios_glass(radius_dp, body_colors, rim_colors, radii=None, top_only=False, sheen=0x1EFFFFFF,
+               parts=None, glints=True, backdrop=None):
+    r = float(dp(radius_dp))
+    w = max(1, dp(1))
+    if radii is None:
+        rim_d = _grad(rim_colors, "TL_BR", r)
+        body = _grad(body_colors, "TL_BR", max(0.0, r - w))
+        top = _grad([sheen, 0x00FFFFFF], "TOP_BOTTOM", max(0.0, r - w))
+        inner = GradientDrawable()
+        inner.setCornerRadius(max(0.0, r - w))
+        rin = [max(0.0, r - w)] * 8
+    else:
+        rin = [x - w if x > 0 else 0.0 for x in radii]
+        rim_d = _grad(rim_colors, "TL_BR", radii=radii)
+        body = _grad(body_colors, "TL_BR", radii=rin)
+        top = _grad([sheen, 0x00FFFFFF], "TOP_BOTTOM", radii=rin)
+        inner = GradientDrawable()
+        inner.setCornerRadii(jarray(jfloat)([float(x) for x in rin]))
+    inner.setColor(0)
+    inner.setStroke(max(1, dp(1)), signed(0x1CFFFFFF))
+    layer_list = [rim_d, body]
+    if backdrop is not None:
+        try:
+            bmp, W, H = backdrop
+            bd, info = _backdrop_layer(bmp, W, H, rin)
+            layer_list.append(bd)
+            if parts is not None:
+                parts["bdinfo"] = info
+        except Exception as e:
+            log("RichFrog backdrop layer: " + str(e))
+    top_idx = len(layer_list)
+    layer_list.append(top)
+    layer_list.append(inner)
+    inner_count = len(layer_list)
+    specs = []
+    if glints:
+        for g in ((Gravity.TOP,) if top_only else (Gravity.TOP, Gravity.BOTTOM)):
+            layer_list.append(_grad([0x00FFFFFF, 0x22FFFFFF, 0xFFFFFFFF, 0x22FFFFFF, 0x00FFFFFF], "LEFT_RIGHT", 0.0))
+            specs.append((len(layer_list) - 1, g))
+    layers = LayerDrawable(jarray(Drawable)(layer_list))
+    bottom = 0 if top_only else w
+    for i in range(1, inner_count):
+        layers.setLayerInset(i, w, w, w, bottom)
+    try:
+        layers.setLayerGravity(top_idx, Gravity.TOP)
+        layers.setLayerHeight(top_idx, int(max(r * 1.2, dp(14))))
+        gap = int(max(r, dp(16)))
+        for i, g in specs:
+            layers.setLayerInset(i, gap, 0, gap, 0)
+            layers.setLayerGravity(i, g)
+            layers.setLayerHeight(i, max(2, int(dp(1.5))))
+    except Exception:
+        pass
+    if parts is not None:
+        parts.update({"rim": rim_d, "body": body, "top": top})
+    return layers
+
+
+_RIM_IOS = [0xF2FFFFFF, 0x26FFFFFF, 0x0DFFFFFF, 0x59FFFFFF, 0xDDFFFFFF]
+
+
+def glass(color, radius_dp):
+    """Чёрное дымчатое жидкое стекло: тонкая светлая кромка, чёрная заливка с лёгким светом сверху-слева."""
+    a = (int(color) >> 24) & 0xFF
+    tail = 0xB8000000 if a < 0x80 else 0x9A000000
+    return _ios_glass(radius_dp, [0x2EFFFFFF, signed(0x66000000), signed(tail)], _RIM_IOS)
+
+
+def accent_pill(accent, radius_dp):
+    """Главные кнопки: тёмно-серое стекло, чуть светлее карточек."""
+    return _ios_glass(radius_dp, [signed(0x80B4B4BC), signed(0x70505058), signed(0xA0202024)], _RIM_IOS,
+                      sheen=0x40FFFFFF)
+
+
+def sheet_bg_parts(backdrop=None):
+    r = float(dp(30))
+    radii = [r, r, r, r, r, r, r, r]
+    parts = {}
+    d = _ios_glass(30, [signed(0xF2141418), signed(0xF40A0A0C), signed(0xFA000000)], _RIM_IOS,
+                   radii=radii, top_only=False, parts=parts, backdrop=backdrop)
+    return d, parts
+
+
+def sheet_bg(dark):
+    return sheet_bg_parts()[0]
+
+
+def light_apply(parts, frac, band):
+    """Кромка и верхний блик меняются при движении шторки (холодный свет -> тёплый)."""
+    try:
+        frac = max(0.0, min(1.0, frac))
+        hr, hg, hb = mix(0xEA, 0xFF, frac), mix(0xF2, 0xE6, frac), mix(0xFF, 0xD2, frac)
+        tl = 255 * (1.0 - 0.5 * frac)
+        brc = 230 * (0.5 + 0.5 * frac)
+        rim = [argb(tl, hr, hg, hb), argb(0x26, 255, 255, 255), argb(0x0D, 255, 255, 255),
+               argb(0x59, hr, hg, hb), argb(brc, hr, hg, hb)]
+        parts["rim"].setColors(jarray(jint)(rim))
+        parts["top"].setColors(jarray(jint)([argb(0x2A * (1.0 - 0.6 * frac), hr, hg, hb), 0x00FFFFFF]))
+    except Exception as e:
+        log("RichFrog light: " + str(e))
+
+
+def theme_colors():
+    """Палитра плагина: чёрное стекло и серые кнопки (не зависит от темы Telegram)."""
+    _DARK[0] = True
+    _ACC[0] = BLUE
+    return {
+        "accent": BLUE, "text": signed(0xFFFFFFFF), "gray": signed(0xFF9A9AA2),
+        "card": signed(0xCC000000), "track": signed(0xFF3A3A3E),
+        "chip": signed(0xCC000000), "dark": True, "ink": signed(0xFF111113),
+    }
+
+
+def opaque(c):
+    """Цвета фонов в TL приходят как RGB без альфы -> делаем непрозрачными."""
+    return signed(0xFF000000 | (int(c) & 0xFFFFFF))
+
+
+def signed(c):
+    c = int(c)
+    return c - (1 << 32) if c >= (1 << 31) else c
+
+
+def rounded(color, radius_dp):
+    g = GradientDrawable()
+    g.setColor(signed(color))
+    g.setCornerRadius(float(dp(radius_dp)))
+    return g
+
+
+class _OutlineSpan(dynamic_proxy(jclass("android.text.style.LineBackgroundSpan"))):
+    """Рисует контур букв позади самого текста: чёткая стеклянная обводка без размытия."""
+
+    def __init__(self, align):
+        super().__init__()
+        self.align = align
+
+    def drawBackground(self, canvas, paint, left, right, top, baseline, bottom, text, start, end, lnum):
+        try:
+            p = Paint(paint)
+            p.setStyle(Paint.Style.STROKE)
+            p.setStrokeWidth(float(dp(1.3)))
+            p.setStrokeJoin(Paint.Join.ROUND)
+            p.setColor(signed(0xA0E6F0FF))
+            p.setShadowLayer(0.0, 0.0, 0.0, 0)
+            w = float(p.measureText(text, int(start), int(end)))
+            if self.align == 1:
+                x = float(left) + (float(right) - float(left) - w) / 2.0
+            elif self.align == 2:
+                x = float(right) - w
+            else:
+                x = float(left)
+            canvas.drawText(text, int(start), int(end), x, float(baseline), p)
+        except Exception:
+            pass
+
+
+def set_out(t, text):
+    """setText с контуром. Выравнивание берётся из gravity вью."""
+    try:
+        from android.text import SpannableString
+        txt = str(text)
+        h = int(t.getGravity()) & 7
+        align = 1 if h == 1 else (2 if h == 5 else 0)
+        sp = SpannableString(txt)
+        if len(txt) > 0:
+            sp.setSpan(_OutlineSpan(align), 0, len(txt), 33)
+        t.setText(sp)
+    except Exception:
+        t.setText(str(text))
+
+
+def make_text(ctx, text, size, color, bold=False, gravity=None):
+    t = TextView(ctx)
+    t.setTextSize(float(size))
+    t.setTextColor(signed(color))
+    if bold:
+        t.setTypeface(Typeface.DEFAULT_BOLD)
+    if gravity is not None:
+        t.setGravity(gravity)
+    set_out(t, text)
+    return t
+
+
+def lin(w=-2, h=-2, wt=None, m=(0, 0, 0, 0)):
+    p = LinearLayout.LayoutParams(w, h) if wt is None else LinearLayout.LayoutParams(w, h, float(wt))
+    p.setMargins(dp(m[0]), dp(m[1]), dp(m[2]), dp(m[3]))
+    return p
+
+
+def frm(w=-2, h=-2, gravity=None, m=(0, 0, 0, 0)):
+    p = FrameLayout.LayoutParams(w, h) if gravity is None else FrameLayout.LayoutParams(w, h, gravity)
+    p.setMargins(dp(m[0]), dp(m[1]), dp(m[2]), dp(m[3]))
+    return p
+
+
+def _show_toast(text):
+    try:
+        from android.widget import Toast
+        from org.telegram.messenger import ApplicationLoader
+        Toast.makeText(ApplicationLoader.applicationContext, str(text), Toast.LENGTH_LONG).show()
+    except Exception as e:
+        log("toast fail: " + str(e))
+
+
+_LAST_ERR = [""]
+
+
+def guarded(fn):
+    """Любая ошибка внутри -> в лог и на экран (раньше глоталась молча)."""
+    def wrap(*a, **kw):
+        try:
+            return fn(*a, **kw)
+        except Exception as e:
+            tb = traceback.format_exc()
+            log("RichFrog ERROR in %s:\n%s" % (fn.__name__, tb))
+            try:
+                _LAST_ERR[0] = "%s: %s" % (fn.__name__, str(e)[:160])
+            except Exception:
+                pass
+            where = ""
+            try:
+                frames = [f for f in traceback.extract_tb(e.__traceback__) if "rating" in str(f.filename).lower() or True]
+                f = frames[-1]
+                where = "\nстрока %s: %s" % (f.lineno, str(f.line)[:80])
+            except Exception:
+                pass
+            msg = str(e).strip().splitlines()
+            head = (msg[0] if msg else type(e).__name__)[:90]
+            _show_toast("Ошибка в %s%s: %s" % (fn.__name__, where.replace("\nстрока ", " (стр. ").split(":")[0] + ")" if where else "", head))
+    wrap.__name__ = fn.__name__
+    return wrap
+
+
+class _Click(dynamic_proxy(View.OnClickListener)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def onClick(self, v):
+        guarded(self.fn)(v)
+
+
+class _Seek(dynamic_proxy(SeekBar.OnSeekBarChangeListener)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def onProgressChanged(self, sb, progress, from_user):
+        try:
+            if from_user:
+                self.fn(int(progress))
+        except Exception as e:
+            log("RichFrog seek error: " + str(e))
+
+    def onStartTrackingTouch(self, sb):
+        pass
+
+    def onStopTrackingTouch(self, sb):
+        pass
+
+
+def emph_dec():
+    """Material 3 emphasized decelerate: быстрый старт, очень мягкая остановка (появление)."""
+    try:
+        return PathInterpolator(0.05, 0.7, 0.1, 1.0)
+    except Exception:
+        return DecelerateInterpolator(2.0)
+
+
+def emph_acc():
+    """Material 3 emphasized accelerate (уход)."""
+    try:
+        return PathInterpolator(0.3, 0.0, 0.8, 0.15)
+    except Exception:
+        return AccelerateInterpolator(1.4)
+
+
+def std_ease():
+    """Material 3 standard (смена содержимого)."""
+    try:
+        return PathInterpolator(0.2, 0.0, 0.0, 1.0)
+    except Exception:
+        return DecelerateInterpolator(1.6)
+
+
+def spring_scale(v, target, stiffness, damping):
+    """Пружина по Material 3 (androidx.dynamicanimation); если недоступна - возвращает False."""
+    try:
+        from androidx.dynamicanimation.animation import SpringAnimation, SpringForce, DynamicAnimation
+        for prop in (DynamicAnimation.SCALE_X, DynamicAnimation.SCALE_Y):
+            anim = SpringAnimation(v, prop)
+            force = SpringForce(float(target))
+            force.setStiffness(float(stiffness))
+            force.setDampingRatio(float(damping))
+            anim.setSpring(force)
+            anim.start()
+        return True
+    except Exception:
+        return False
+
+
+class _Touch(dynamic_proxy(View.OnTouchListener)):
+    """Жидкое «нажатие»: плитка вдавливается и пружинит обратно с перелётом."""
+
+    def onTouch(self, v, e):
+        try:
+            a = int(e.getActionMasked())
+            if a == 0:
+                v.animate().cancel()
+                if not spring_scale(v, 0.97, 1500.0, 1.0):
+                    v.animate().setStartDelay(0).scaleX(0.97).scaleY(0.97).setDuration(100).setInterpolator(
+                        emph_dec()).start()
+            elif a == 1 or a == 3:
+                # критическое демпфирование: возвращается ровно в 1.0, без перелёта за границы (раньше упиралось в края)
+                if not spring_scale(v, 1.0, 700.0, 1.0):
+                    v.animate().setStartDelay(0).scaleX(1.0).scaleY(1.0).setDuration(160).setInterpolator(
+                        std_ease()).start()
+        except Exception:
+            pass
+        return False
+
+
+class _AnimUpdate(dynamic_proxy(jclass("android.animation.ValueAnimator$AnimatorUpdateListener"))):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def onAnimationUpdate(self, anim):
+        try:
+            self.fn(float(anim.getAnimatedFraction()))
+        except Exception:
+            pass
+
+
+class _DismissL(dynamic_proxy(jclass("android.content.DialogInterface$OnDismissListener"))):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def onDismiss(self, dialog):
+        try:
+            self.fn()
+        except Exception:
+            pass
+
+
+class _KbLayout(dynamic_proxy(View.OnLayoutChangeListener)):
+    """Окно ужимается/растягивается при показе/скрытии клавиатуры (adjustResize) — шторка прыгала.
+    Гасим скачок: ставим её на прежнее место и плавно едем на новое."""
+
+    def __init__(self, plugin, wrap):
+        super().__init__()
+        self.plugin = plugin
+        self.wrap = wrap
+
+    def onLayoutChange(self, v, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom):
+        try:
+            nh, oh = int(bottom - top), int(oldBottom - oldTop)
+            if oh <= 0 or nh == oh or nh <= 0:
+                return
+            pl = self.plugin
+            if getattr(pl, "_sheet_closing", False) or time.time() - getattr(pl, "_open_t", 0.0) < 0.55:
+                return
+            delta = float(nh - oh)          # < 0 — клавиатура появилась, > 0 — спряталась
+            self.wrap.animate().cancel()
+            self.wrap.setTranslationY(float(self.wrap.getTranslationY()) - delta)
+            self.wrap.animate().setStartDelay(0).translationY(0.0).setDuration(280).setInterpolator(
+                emph_dec()).setUpdateListener(_AnimUpdate(lambda f: pl._sheet_light())).start()
+        except Exception as e:
+            log("RichFrog kb layout: " + str(e))
+
+
+class _Drag(dynamic_proxy(View.OnTouchListener)):
+    """Тянешь за ручку шторки вниз - она следует за пальцем и закрывается/пружинит назад."""
+
+    def __init__(self, plugin, wrap):
+        super().__init__()
+        self.plugin = plugin
+        self.wrap = wrap
+        self.y0 = 0.0
+
+    def onTouch(self, v, e):
+        try:
+            a = int(e.getActionMasked())
+            if a == 0:
+                self.wrap.animate().cancel()
+                self.y0 = float(e.getRawY()) - float(self.wrap.getTranslationY())
+            elif a == 2:
+                self.wrap.setTranslationY(max(0.0, float(e.getRawY()) - self.y0))
+                self.plugin._sheet_light()
+            elif a == 1 or a == 3:
+                if float(self.wrap.getTranslationY()) > dp(110):
+                    self.plugin.close_sheet()
+                else:
+                    self.wrap.animate().setStartDelay(0).translationY(0.0).setDuration(420).setInterpolator(
+                        OvershootInterpolator(1.8)).setUpdateListener(
+                        _AnimUpdate(lambda f: self.plugin._sheet_light())).start()
+        except Exception as ex:
+            log("RichFrog drag error: " + str(ex))
+        return True
+
+
+class _SwitchTouch(dynamic_proxy(View.OnTouchListener)):
+    """Пока палец на переключателе, бегунок растягивается, как в iOS."""
+
+    def __init__(self, thumb):
+        super().__init__()
+        self.thumb = thumb
+
+    def onTouch(self, v, e):
+        try:
+            a = int(e.getActionMasked())
+            if a == 0:
+                self.thumb.animate().cancel()
+                self.thumb.animate().setStartDelay(0).scaleX(1.22).scaleY(1.08).setDuration(160).setInterpolator(
+                    emph_dec()).start()
+            elif a == 1 or a == 3:
+                self.thumb.animate().setStartDelay(0).scaleX(1.0).scaleY(1.0).setDuration(360).setInterpolator(
+                    OvershootInterpolator(2.2)).start()
+        except Exception:
+            pass
+        return False
+
+
+def ios_switch(ctx, checked):
+    """Переключатель в стиле iOS Liquid Glass. Возвращает (вью, set_checked(value, animate), thumb)."""
+    TW, TH, KW, KH, PAD = 62, 34, 40, 28, 3
+    travel = float(dp(TW - KW - PAD * 2))
+    box = FrameLayout(ctx)
+    tr = float(dp(TH)) / 2.0
+    w = max(1, dp(1))
+    rim = _grad([0xDDFFFFFF, 0x30FFFFFF, 0x30FFFFFF, 0xAAFFFFFF], "TL_BR", tr)
+    body = _grad([0x6E8E8E93, 0x4A6E6E73], "TOP_BOTTOM", max(0.0, tr - w))
+    track_d = LayerDrawable(jarray(Drawable)([rim, body]))
+    track_d.setLayerInset(1, w, w, w, w)
+    track = View(ctx)
+    track.setBackground(track_d)
+    box.addView(track, frm(dp(TW), dp(TH)))
+    kr = float(dp(KH)) / 2.0
+    k_rim = _grad([0xFFFFFFFF, 0x99FFFFFF, 0xCCFFFFFF], "TL_BR", kr)
+    k_body = _grad([0xFFFFFFFF, 0xE6E4E4EA], "TOP_BOTTOM", max(0.0, kr - w))
+    thumb_d = LayerDrawable(jarray(Drawable)([k_rim, k_body]))
+    thumb_d.setLayerInset(1, w, w, w, w)
+    thumb = View(ctx)
+    thumb.setBackground(thumb_d)
+    box.addView(thumb, frm(dp(KW), dp(KH), Gravity.LEFT | Gravity.CENTER_VERTICAL, (PAD, 0, 0, 0)))
+
+    OFF = ((0x6E, 0x8E, 0x8E, 0x93), (0x4A, 0x6E, 0x6E, 0x73))
+    ON = ((0xE6, 0x34, 0xC7, 0x59), (0xC8, 0x2A, 0xA8, 0x4A))
+    state = {"f": 1.0 if checked else 0.0, "anim": None}
+
+    def apply(f):
+        state["f"] = f
+        cols = []
+        for i in (0, 1):
+            cols.append(argb(*[mix(OFF[i][j], ON[i][j], f) for j in range(4)]))
+        body.setColors(jarray(jint)(cols))
+        thumb.setTranslationX(travel * f)
+
+    def set_checked(value, animate=True):
+        target = 1.0 if value else 0.0
+        start = state["f"]
+        if state["anim"] is not None:
+            try:
+                state["anim"].cancel()
+            except Exception:
+                pass
+        if not animate or start == target:
+            apply(target)
+            return
+        va = ValueAnimator.ofFloat(0.0, 1.0)
+        va.setDuration(360)
+        va.setInterpolator(emph_dec())
+        va.addUpdateListener(_AnimUpdate(lambda fr: apply(start + (target - start) * fr)))
+        state["anim"] = va
+        va.start()
+
+    apply(state["f"])
+    return box, set_checked, thumb
+
+
+def _arrow_glyph(ctx, kind, color, size_dp, box_dp):
+    box = FrameLayout(ctx)
+    box.setClickable(True)
+    t = make_text(ctx, "‹" if kind == "left" else "›", int(size_dp * 1.9), color, True, Gravity.CENTER)
+    box.addView(t, frm(-1, -1, Gravity.CENTER))
+    return box
+
+
+def _icon_bars(ctx, segs, color, size_dp, stroke_u=3.3):
+    """Иконка из скруглённых полосок в сетке 24x24. Центр рисунка = центр вью."""
+    S = float(dp(size_dp))
+    k = S / 24.0
+    T = max(2, int(round(stroke_u * k)))
+    holder = FrameLayout(ctx)
+    for x1, y1, x2, y2 in segs:
+        x1, y1, x2, y2 = x1 * k, y1 * k, x2 * k, y2 * k
+        L = int(round(math.hypot(x2 - x1, y2 - y1) + T))
+        v = View(ctx)
+        g = GradientDrawable()
+        g.setColor(signed(color))
+        g.setCornerRadius(float(T) / 2.0)
+        v.setBackground(g)
+        holder.addView(v, frm(L, T, Gravity.LEFT | Gravity.TOP))
+        v.setTranslationX(float((x1 + x2) / 2.0 - L / 2.0))
+        v.setTranslationY(float((y1 + y2) / 2.0 - T / 2.0))
+        v.setRotation(float(math.degrees(math.atan2(y2 - y1, x2 - x1))))
+    return holder
+
+
+_ICON_SEGS = {
+    "left": [(19.0, 12.0, 5.5, 12.0), (11.5, 5.5, 5.0, 12.0), (5.0, 12.0, 11.5, 18.5)],
+    "right": [(5.0, 12.0, 18.5, 12.0), (12.5, 5.5, 19.0, 12.0), (19.0, 12.0, 12.5, 18.5)],
+    "check": [(5.2, 12.3, 10.0, 17.1), (10.0, 17.1, 18.8, 7.3)],
+}
+
+
+def arrow_btn(ctx, kind, color, size_dp=18, box_dp=40):
+    """Иконка-кнопка строго по центру своего места. kind: 'left' | 'right' | 'check'."""
+    try:
+        icon = _icon_bars(ctx, _ICON_SEGS[kind], color, size_dp)
+        box = FrameLayout(ctx)
+        box.setClickable(True)
+        box.addView(icon, frm(dp(size_dp), dp(size_dp), Gravity.CENTER))
+        return box
+    except Exception as e:
+        log("RichFrog icon fallback: " + str(e))
+        return _arrow_glyph(ctx, "left" if kind == "left" else "right", color, size_dp, box_dp)
+
+
+def switch_row(ctx, C, label, getter, setter):
+    """Строка «подпись + iOS-переключатель» на стеклянной карточке."""
+    row = LinearLayout(ctx)
+    row.setOrientation(LinearLayout.HORIZONTAL)
+    row.setGravity(Gravity.CENTER_VERTICAL)
+    set_bg(row, glass(C["card"], 22))
+    row.setPadding(dp(16), dp(8), dp(12), dp(8))
+    row.addView(make_text(ctx, label, 17, C["text"]), lin(0, -2, 1))
+    sw, set_checked, thumb = ios_switch(ctx, bool(getter()))
+    row.addView(sw, lin(-2, -2))
+
+    def flip(v):
+        new = not bool(getter())
+        setter(new)
+        set_checked(new, True)
+
+    on_click(row, flip, False)
+    row.setOnTouchListener(_SwitchTouch(thumb))
+    return row
+
+
+_TOUCH = []
+
+
+def on_click(view, fn, press=True):
+    view.setOnClickListener(_Click(fn))
+    if press:
+        try:
+            if not _TOUCH:
+                _TOUCH.append(_Touch())
+            view.setOnTouchListener(_TOUCH[0])
+        except Exception:
+            pass
+
+
+# ======================================================================
+# Значки уровней (как на фото: 1 щит, 2 квадрат, 3 щит, 4 ромб, 5.. многоугольники, 10+ розетка)
+# ======================================================================
+def _rounded_poly(pts, t):
+    path = Path()
+    n = len(pts)
+    for i in range(n):
+        p_prev = pts[(i - 1) % n]
+        p = pts[i]
+        p_next = pts[(i + 1) % n]
+        a = (p[0] + (p_prev[0] - p[0]) * t, p[1] + (p_prev[1] - p[1]) * t)
+        b = (p[0] + (p_next[0] - p[0]) * t, p[1] + (p_next[1] - p[1]) * t)
+        if i == 0:
+            path.moveTo(float(a[0]), float(a[1]))
+        else:
+            path.lineTo(float(a[0]), float(a[1]))
+        path.quadTo(float(p[0]), float(p[1]), float(b[0]), float(b[1]))
+    path.close()
+    return path
+
+
+def _regular_poly(n, radius=43.0, cx=50.0, cy=52.0, start=-math.pi / 2):
+    pts = []
+    for i in range(n):
+        ang = start + 2 * math.pi * i / n
+        pts.append((cx + radius * math.cos(ang), cy + radius * math.sin(ang)))
+    return pts
+
+
+def _fit(pts, size=80.0):
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    k = size / max(max(xs) - min(xs), max(ys) - min(ys))
+    cx = (max(xs) + min(xs)) / 2.0
+    cy = (max(ys) + min(ys)) / 2.0
+    return [(50.0 + (x - cx) * k, 50.0 + (y - cy) * k) for x, y in pts]
+
+
+def _bez(p0, c, p1, n=10):
+    out = []
+    for i in range(1, n + 1):
+        t = i / float(n)
+        u = 1.0 - t
+        out.append((u * u * p0[0] + 2 * u * t * c[0] + t * t * p1[0],
+                    u * u * p0[1] + 2 * u * t * c[1] + t * t * p1[1]))
+    return out
+
+
+BADGE_SHAPES = [
+    [23.5,14.8,18.9,19.4,16.7,34.8,19.4,59.3,22.1,66.1,28.5,73.4,35.7,78.8,47.1,84.7,52.9,84.7,60.7,81.5,77.4,67.5,80.6,59.8,82.9,45.2,82.9,27.1,80.6,19.4,75.6,14.4],
+    [22.8,17.3,18.7,21.4,13.3,32.8,13.3,66.8,18.7,78.1,28.7,84.9,44.6,86.3,67.2,85.8,73.1,84.5,79.9,80.4,86.3,70,86.3,29.6,81.3,21,72.7,14.6,68.1,13.7,35.9,13.3],
+    [13.9,17.8,9.4,24.1,9.9,33.7,15.3,50.5,21.6,62.7,30.7,74.5,42.5,84.5,48.4,86.7,52,86.7,57,84.5,67.5,75.4,82.9,52.3,90.1,29.6,88.3,20.1,84.7,17.3,75.2,14.6,52,12.8,24.8,14.6],
+    [48,10.1,42.1,11.4,35.7,15.1,14.8,36.4,11.2,42.3,9.9,51.8,11.2,57.7,15.3,64.1,36.6,84.9,42.1,88.1,52,89.5,57.9,88.1,62.9,84.9,82,66.8,88.8,56.4,89.7,46.4,85.2,36.8,65.6,16.9,57.5,11.4],
+    [69.5,11.4,49.1,11,25.5,13.3,20.1,21.9,10.1,55,11,62.2,33.7,79.9,49.1,89,57.3,86.3,87.2,62.7,89.5,57.3,87.2,45.9,75.4,15.1],
+    [50.5,9.9,43.2,12.1,18.2,26.6,14.6,31.6,13.7,37.5,14.6,69.3,26.4,78.4,47.3,89.7,54.5,88.8,76.8,76.1,84,70.6,85.4,65.6,85.8,38.9,84,29.8,76.3,23.5],
+    [34.8,12.1,28,17.1,12.1,38.9,11.7,43.4,15.3,57.5,16.2,67.9,22.1,75.6,46.1,87.9,51.6,87.9,76.1,76.5,80.2,73.4,86.5,50.7,87.4,38.9,71.5,17.1,66.6,12.6],
+    [30.3,14.4,13,33,13.9,67.5,31.6,85.2,50.7,86.1,65.2,85.6,69.7,84.2,86.5,66.1,86.1,32.5,80.2,24.8,67.9,13.9],
+    [40.9,14.2,28.7,20.1,18.7,30.5,13.7,44.1,13.7,56.4,19.2,70,31.4,81.3,39.1,84.9,45.5,85.8,60.9,84.9,74.9,76.8,83.1,65.9,86.3,55.4,86.3,42.3,79.9,28.7,73.1,21,58.6,14.2],
+    [16.7,15.3,13.5,21.2,13,50.7,13.5,69.3,18,73.8,47.1,87.9,50.7,88.3,84.2,72,86.5,68.4,86.5,23,82.4,14.8,78.8,12.1,73.4,11.2,22.1,11.7],
+    [19.8,12.8,13.5,21.9,13,66.8,17.1,73.6,47.5,88.1,51.1,88.6,77.4,76.3,85.2,70.9,86.5,60.9,86.1,21.4,80.2,12.8,74.3,11.4,40.7,11],
+    [16.2,16.2,13,23.9,13,66.6,18,73.8,48,88.3,51.1,88.3,70.6,79.7,86.1,70.2,86.5,22.1,83.3,15.8,79.7,12.6,72.9,11.2,26.6,11.2,20.3,12.6],
+    [16.9,15.3,13.3,23,13.3,66.6,14.2,69.7,17.8,73.8,48.2,88.3,51.4,88.3,82.7,73.4,85.4,70.6,86.3,23.5,85.4,18.9,80.4,13,73.1,11.2,26,11.2,21,12.1],
+    [16.7,15.8,13.5,25.7,13.5,67.5,16.7,72.9,42.1,85.6,51.6,88.3,82,73.8,84.7,71.1,86.1,58.8,85.6,20.7,81.1,13.9,73.4,11.2,27.5,11.2,20.7,12.1],
+    [79.5,12.8,62.2,11,25.1,11.4,18.7,13.7,14.2,19.2,13.3,23.7,13.3,59.5,14.6,71.3,21,75.9,49.1,88.6,51.4,88.6,83.6,72.7,85.4,69.1,86.3,60.4,85.8,24.1,84,17.3],
+    [16.4,15.1,13.3,21,13.3,70,17.3,74,50,88.6,77.7,76.3,84.5,70.9,86.3,65.9,85.8,21.9,83.1,16.4,79.5,13.3,74,11.4,31.9,11,20.5,12.4],
+    [16,15.8,13.3,22.1,13.3,68.8,16,72.9,41.4,85.6,50.5,88.3,82.2,73.4,85.4,69.7,86.3,22.1,79.9,13,73.1,11.2,26.9,11.2,20.5,12.1],
+    [15.8,16.2,13,22.6,13,67,17.1,73.4,28.5,79.7,50.7,88.3,81.1,74.3,85.2,70.6,86.5,67,86.5,22.6,83.8,16.7,79.7,12.6,73.8,11.2,25.3,11.2,19.8,12.6],
+    [15.8,16.2,13,22.6,13,64.7,13.9,69.3,17.1,73.4,48.4,88.3,51.1,88.3,82,73.8,85.6,70.2,86.5,23.9,85.6,19.8,82,14.4,74.3,11.2,25.3,11.2,20.3,12.6],
+    [13.9,12.8,13.5,79.5,16.2,83.1,23,87.2,35.3,87.6,77,87.2,83.8,83.1,86.5,79,86.5,13.7,81.1,11.9,61.6,16.4,57,18.7,47.1,19.6,18.9,11.9],
+    [13.5,13.9,13,45.2,13.5,78.8,19.8,86.5,23.9,87.9,77.4,87.4,82.4,84.7,86.1,80.2,86.5,13.9,85.2,12.6,80.2,12.6,53.9,19.4,45.7,19.4,17.6,11.7],
+    [85.2,12.1,73.8,13.5,70.2,15.8,63.4,16.2,52,19.8,17.1,12.1,13.5,14.4,13,75.2,13.5,78.8,16.7,83.8,23,87.9,77.4,87.4,83.3,83.8,86.1,80.2,86.5,25.3],
+    [15.5,11.9,13.3,15.1,13.3,77.2,18.2,85.4,25.1,87.6,75.9,87.6,82.7,84,85.8,79.5,86.3,76.3,85.8,13.3,84.5,11.9,74.5,13.3,54.1,19.2,48.2,19.6,26,13.3],
+    [15.3,11.9,13.5,18.2,13.5,77.2,17.1,84,24.8,87.6,76.1,87.6,81.5,85.4,85.2,80.8,86.1,76.3,85.2,12.8,77,12.8,56.1,18.7,45.7,19.2,25.7,13.3],
+    [15.1,11.9,13.3,16,13.3,77.2,16.9,84,22.3,87.2,74,87.6,79.5,86.3,83.1,83.6,85.8,77.2,86.3,20.1,84.9,12.8,81.3,11.9,48.6,19.6],
+    [14.4,12.4,13,24.6,13.5,79.5,15.8,83.1,19.8,86.3,24.4,87.6,77.4,87.2,82.9,83.6,86.5,75.4,86.1,13.7,81.5,11.9,54.8,19.2,48,19.6,25.7,13.3],
+    [14.8,12.4,13,16.4,13.5,79.5,15.8,83.1,20.7,86.7,26.2,87.6,74.7,87.6,82.4,84,86.5,78.6,86.5,14.2,81.1,11.9,54.3,19.2,48.4,19.6,24.8,13.3],
+    [84.7,12.6,82.4,11.7,73.4,13.5,67.5,16.2,51.6,19.8,41.2,18.5,18,12.1,13.5,13.9,13,77.9,16.7,83.8,21.2,87,25.7,87.9,73.8,87.9,80.2,86.5,83.3,83.3,86.5,77.4,86.5,15.8],
+    [14.4,12.8,13,15.1,13,77.2,15.3,82.2,20.7,86.7,28.9,87.6,75.6,87.6,81.5,84.9,86.1,79.9,86.1,13.7,81.5,11.9,56.1,18.7,48,19.6,28.5,15.1,25.7,13.3,18,11.9],
+    [86.1,11.7,82,9.4,57,16.7,46.6,17.6,26.6,11.2,14.4,10.3,13,12.6,13.5,72,16.2,75.2,48.4,90.1,52,90.1,83.8,75.2,86.5,71.1],
+    [13.9,11,13.5,70.4,16.2,74.9,47.5,89.9,51.6,89.9,83.8,74.9,86.1,71.8,85.6,10.5,81.5,9.6,52.9,17.3,45.2,16.9,18,9.6],
+    [85.2,9.9,72.9,11.2,70.2,13.5,62,14.4,52.9,17.6,44.8,17.1,24.4,10.8,14.4,10.8,13,13.5,13,67.9,15.8,74.3,23,79.3,48,90.1,51.6,90.1,83.3,75.6,85.6,73.4,86.5,69.7,86.5,12.6],
+    [85.8,11,80.8,9.6,55.4,16.9,47.7,17.3,38.2,14.2,32.3,13.7,26.4,11,14.6,10.5,13.3,12.8,13.3,69.5,15.1,73.6,18.7,76.8,47.7,89.9,51.4,89.9,65.9,84,82.7,75.4,85.8,72.2,86.3,65.4],
+    [14.8,10.1,13.5,17.3,13.5,67.2,15.8,74.9,48,89.9,51.6,89.9,83.3,74.9,86.1,70,86.1,12.4,84.2,9.6,75.6,10.5,52.5,17.3,44.3,16.9,26.2,11],
+    [14.4,10.5,13.9,71.8,17.1,75.4,41.6,87.2,51.6,89.9,77.4,78.6,84.7,74,86.1,70.9,86.1,11.9,84.7,10.1,73.8,11,51.1,17.8,30.3,13.3,24.4,10.5],
+    [13.5,10.8,13.5,71.5,16.2,75.2,48.9,90.1,65.6,83.8,84.2,73.8,86.5,67.9,86.5,11.7,85.2,10.3,74.7,10.3,52.5,17.1,43,16.2,24.4,10.3,15.3,9.4],
+    [13.3,12.1,13.3,71.1,16,75.6,42.3,87.9,50.9,90.1,71.3,81.5,83.6,74.7,86.3,70.6,85.4,10.8,80.4,9.9,72.7,11.2,50,18,17.3,9.4],
+    [13.9,11,13,70,16.7,75.4,27.5,81.3,50.2,90.4,78.4,78.1,84.2,74,86.5,70.4,85.6,10.5,82,9.2,72.9,11,68.8,13.3,52.5,17.3,43,16.4,17.1,9.2],
+    [13.7,11.9,13.3,69.1,16.9,75.4,35.5,84.5,51.4,89.9,77.7,78.6,85.4,73.1,85.8,10.5,76.3,10.5,51.8,17.3,43.2,16.4,24.6,10.5,16.9,9.6],
+    [8,22.3,7.6,28.7,16.7,79,21.6,85.8,28.5,89,71.5,89,77.4,86.3,83.3,79.5,87,52.7,89.7,43.6,92,30,91.5,22.3,85.2,21.4,70.2,24.6,51.1,10.5,47.5,11,29.8,24.6,15.3,21.4],
+    [7.8,22.3,7.4,28.2,16,76.8,20.1,84.5,28.2,89,69.5,89,75.9,87.2,80.4,83.6,83.1,78.6,89.9,35.9,91.7,31.9,91.3,21.9,84.5,21.4,69.5,24.6,50.9,10.5,48.2,10.5,30,24.6,14.2,21.4],
+    [8.5,22.3,7.6,26.9,13.5,62.2,15.3,66.3,16.2,77.2,22.6,86.3,28.5,89,71.5,89,80.2,84,82.9,79.9,86.1,65,86.5,56.4,92,30.9,92,22.3,85.2,21.4,69.7,24.6,51.1,10.5,48,10.5,30.3,24.6,15.3,21.4],
+    [8.9,21.9,7.6,23.2,8.5,34.1,15.3,74.5,18,82.2,21.2,85.8,27.5,89,68.8,89,76.5,86.7,82.4,80.4,91.5,30.5,91.1,21.9,84.2,21.4,69.3,24.6,51.1,10.5,47.5,10.5,29.4,24.6,15.3,21.4],
+    [8.7,21.9,8.3,33.2,11.4,53.6,14.2,62.2,14.6,70.9,17.3,81.3,21,85.4,28.7,89,69.5,89,74.9,87.6,79.9,84,82.2,80.4,87.6,53.6,87.6,46.8,91.3,31.4,90.8,21.9,83.6,21.4,70,24.6,51.4,10.5,47.7,10.5,29.6,24.6,22.3,22.3],
+    [8.7,21.9,8.3,35,10.5,41.8,14.2,68.6,16.9,79.9,21.4,85.8,28.7,89,71.8,89,80.4,83.6,84.5,71.8,87.6,53.6,87.6,47.7,91.3,31.9,90.8,21.9,84.5,21.4,70,24.6,51.4,10.5,47.7,10.5,30,24.6,15.5,21.4],
+    [8.5,21.9,8,34.1,9.9,37.8,13.9,67.7,16.7,79.9,19.8,84.5,28.5,89,71.5,89,77.9,85.8,82.9,79,92,26.9,91.5,22.3,84.7,21.4,68.8,24.1,51.1,10.5,48.4,10.5,30.3,24.6,14.8,21.4],
+    [8.5,22.1,7.6,31.6,9.4,35.7,13.9,66.1,15.8,70.6,16.7,80.6,21.2,86.1,29.4,89.2,70.6,89.2,77.4,86.5,83.3,79.7,84.2,67,86.5,62.5,86.5,55.7,92,26.6,91.1,22.1,81.5,22.1,70.2,24.8,50.2,10.3,43.9,13.5,29.8,24.8,14.8,21.6],
+    [8.3,22.3,7.4,27.8,10.1,36.8,10.1,43.6,16.9,79.5,22.8,86.7,28.2,89,71.3,89,77.7,86.3,80.8,83.1,83.6,77.7,89.9,36.8,92.2,29.6,91.3,21.9,87.2,21,70,24.6,51.4,10.5,48.6,10.5,30.5,24.6,14.6,21.4],
+    [8.9,22.1,7.6,23.5,13,61.6,17.6,81.1,22.1,86.5,28.5,89.2,70.6,89.2,77,87,81.5,82.4,88.8,49.3,89.7,38.4,92,32.1,91.5,22.1,84.7,21.6,69.7,24.8,50.2,10.3,28.9,24.8,22.6,22.6],
+    [49.3,7.6,35.3,18.9,29.8,21.6,8.9,19.4,7.6,20.7,7.6,27.5,9.9,33.9,17.1,74.7,23,81.1,43.4,90.6,51.6,92,77,81.1,81.1,77,83.8,70.2,87,48.9,89.7,40.7,92,20.7,89.7,19.4,69.3,21.2,61.6,16.7,55.7,10.8],
+    [48,7.8,35.7,18.2,28.9,21.9,21.2,19.6,9.4,19.2,7.1,22.3,15.8,64.5,16.2,72.2,18.9,76.8,28.9,84,32.5,84.5,47.1,91.7,51.1,91.7,77,80.8,81.1,76.8,86.1,59.5,92.4,21,90.6,19.2,82.9,19.2,70.6,21.4,64.3,18.2,52.5,8.3],
+    [8.3,19.6,7.4,22.3,9.2,35.5,15.1,62.2,15.5,70,18.2,76.3,22.8,80.8,42.3,89.9,51.4,91.7,70.4,84,80.4,77.7,82.7,73.6,88.6,45.5,89,37.8,91.7,28.2,91.3,19.6,84,19.2,69.5,21.4,51.4,7.8,47.3,8.3,34.6,19.2,30,21.4,16,19.2],
+    [48.9,7.6,30.3,21.2,10.3,18.9,8,20.3,7.6,23.9,14.8,61.6,14.8,67.9,18.5,77.4,28.9,84.2,42.1,90.1,50.7,92,72,83.3,81.5,76.1,84.7,66.1,86.1,52.5,87.9,48.9,91.5,29.8,92,21.2,90.1,19.4,69.3,21.2,65.6,19.8,52.5,8.5],
+    [8.7,19.6,8.7,30.9,17.3,74,22.3,80.4,42.7,89.9,52.3,91.7,78.1,80.4,82.2,75.9,91.3,31.9,90.8,19.2,69.1,21,51.8,7.8,47.7,7.8,30.9,21.4,15.5,19.2],
+    [48.9,7.8,30.3,21.4,8.9,19.2,7.6,21.4,14.4,62.7,18,75.9,21.6,79.9,28.5,84,33,84.9,42.5,89.9,51.1,91.7,72,83.6,81.5,76.3,84.7,68.1,92,20.5,90.6,19.2,68.8,21,52,7.8],
+    [47.7,7.8,30,21.4,9.2,19.2,7.8,20.1,7.8,26,17.3,74.9,22.8,80.8,42.7,89.9,50.9,91.7,76.8,80.8,81.3,76.3,86.7,55.4,91.7,20.5,87.2,18.7,69.1,21,53.2,8.7],
+    [8.7,19.4,7.4,23,10.5,42.5,13.3,50.7,16.4,73.4,19.6,78.4,28.2,83.8,42.7,90.1,51.8,92,77.2,81.1,80.8,77,84,69.3,84.5,62,86.7,57.9,92.2,22.6,91.3,19.8,69.5,21.2,64.1,18.5,50.5,7.6,28.7,22.1,21.4,19.8],
+    [49.3,7.4,29.8,21.4,9.4,19.2,7.6,20.5,7.6,28.2,9.9,33.7,9.9,40,15.3,68.1,18.9,77.2,28.9,84,50.2,92.2,70.6,84,80.6,77.2,83.3,71.8,86.1,59.5,92,20.5,90.1,19.2,69.3,21,60.2,15.5,52.5,8.3],
+    [49.3,7.6,29.8,21.6,17.1,19.4,9.4,19.4,7.6,21.6,15.8,70.2,18.9,77.4,28.9,84.2,43.9,90.6,50.7,92,56.6,90.6,77.4,80.6,82.4,74.7,92,28.5,92,20.3,83.8,19.4,69.3,21.6,54.3,9.9],
+    [48,6.2,32.5,19.4,16.7,23.9,13,27.1,10.8,34.4,14.4,49.3,10.8,67,13,73.4,32.1,79.7,43.9,91.1,49.8,93.3,55.7,91.5,66.6,80.6,80.6,76.5,87,72.9,88.8,65.2,84.7,50.2,88.8,30.7,83.8,24.4,67.9,19.8,56.6,8.9,52.5,6.7],
+    [48.9,6.5,43.9,9.2,32.1,20.1,17.6,24.1,12.1,28.2,11.2,35.5,14.8,52.3,10.8,67.2,13.5,73.6,32.5,80.4,44.3,91.7,51.1,93.1,55.2,91.7,67,80.4,82,76.3,87.4,72.7,88.8,64.1,85.2,53.2,85.2,48.2,88.8,35.5,88.8,30.9,85.6,25.5,68.8,20.5,56.1,9.2,51.6,6.5],
+    [47.1,6.5,31.6,20.1,15.8,24.6,11.7,28.2,10.8,32.3,14.8,52.3,12.6,55.9,10.8,67.2,13.5,74,31.6,79.9,43.4,91.3,51.1,93.1,55.2,91.3,67,80.4,73.4,77.7,80.2,76.8,85.6,74,87.9,71.3,88.3,63.2,86.1,58.6,84.7,48.2,88.8,30.9,84.2,25.1,69.3,21,52.5,6.9],
+    [47.3,6.5,30.5,20.5,15.5,24.6,11.9,27.8,11,35,14.2,53.2,11.9,58.2,11,69.5,12.8,73.6,32.8,80.8,42.7,90.8,50.5,93.1,55,91.7,66.3,80.4,80.8,76.3,87.2,72.2,88.6,66.3,85.8,58.2,84.9,48.2,88.1,36.4,88.1,29.6,83.6,24.6,69.5,21,65,18.2,55.9,9.2,51.4,6.5],
+    [49.3,6.5,43.9,9.2,31.2,20.5,15.8,24.6,11.7,28.7,11.2,36.8,14.4,45.9,14.4,54.5,12.1,58.6,11.2,69.5,12.1,72.2,17.6,76.3,32.5,80.4,44.3,91.7,51.6,93.1,55.2,91.7,66.6,80.8,75.6,77.2,82,76.3,87.4,72.7,88.3,63.6,85.2,54.1,85.2,46.8,87.9,39.6,88.3,30,83.3,24.1,68.4,20.5,56.6,9.6],
+    [48.4,6.5,43.4,9.2,31.2,20.5,17.6,24.1,12.1,28.2,11.2,36.8,13.9,44.6,14.4,53.2,11.7,60.9,11.2,70,12.1,72.2,17.1,75.9,33,80.4,44.3,91.7,51.6,93.1,55.2,91.7,67.5,80.4,82,76.3,87.4,72.7,88.3,63.6,84.7,51.4,87.9,39.1,88.3,30.5,84.2,24.6,67.9,20.1,57.5,10.1,52.5,6.9],
+    [48.6,6.2,44.1,8.5,30.9,20.3,15.1,24.8,11.9,28.5,11,36.2,13.7,43.4,14.2,52.9,11,62.5,11,69.7,15.1,74.7,32.8,80.6,44.1,91.5,50,93.3,56.4,90.6,67.7,79.7,81.8,76.1,87.2,72.9,88.6,65.6,84.5,49.8,87.2,42.5,88.1,29.8,83.6,24.4,67.7,19.8,56.8,9.4],
+    [49.1,6.5,43.6,9.2,30.5,21,16,24.6,11,30.9,14.6,51.4,11,68.1,12.4,72.2,16.9,75.9,32.8,80.4,44.1,91.7,50.9,93.1,55,91.7,67.7,79.9,81.8,76.3,87.2,72.7,88.6,65.4,84.9,48.2,86.7,45,88.6,30.9,87.2,27.3,83.6,24.6,68.1,20.5,53.2,6.9],
+    [51.6,6.2,47.5,6.7,31.6,20.3,16.2,24.4,11.2,31.2,14.8,48.9,10.8,66.6,13,72.5,17.1,75.6,33,80.2,44.3,91.5,48.9,93.3,56.1,91.1,67,80.2,82.9,76.1,87.4,72.9,88.8,69.7,88.8,62.9,85.6,52.9,85.6,48,88.8,36.6,87.9,27.5,84.2,24.4,68.8,20.3],
+    [48.6,6.5,42.7,9.6,31.4,20.5,16.9,24.1,12.4,27.8,11,35.5,14.2,52.7,11,66.8,12.4,73.1,16.9,76.3,31.4,79.9,44.6,91.7,51.4,93.1,55.9,91.3,66.8,80.4,81.8,76.3,87.6,71.8,88.6,63.2,84.9,50,88.6,35.5,88.6,30,83.6,24.6,68.1,20.5,55.9,9.2],
+    [65.9,7.8,56.8,9.2,52.3,11.4,45.5,11.4,37.3,8.3,29.6,9.6,26,14.2,21.4,26,14.2,30.5,7.8,38.2,7.8,44.1,15.5,58.6,14.2,67.7,16.4,75.9,22.3,79.5,33.7,80.4,47.3,91.7,55.9,90.8,67.2,80.4,78.6,79,83.6,76.3,86.7,71.3,84.9,56.8,92.2,43.2,92.2,36.8,89.5,32.8,78.1,24.6,72.2,11],
+    [66.1,7.8,56.1,9.2,51.1,11.9,46.6,11.9,43.4,9.6,37.1,8.3,29.4,9.6,24.8,16.4,21.6,25.5,11.7,32.8,7.6,38.2,8,44.1,15.8,58.6,14.8,69.5,16.7,76.3,22.6,79.5,33.4,80.4,48.4,91.7,55.2,90.8,67.5,79.9,77.4,79,82.9,76.8,86.1,72.2,84.7,57.3,87,50.9,92,43.6,92,36.4,88.8,32.3,78.4,25.5,71.1,9.6],
+    [69.5,8.7,63.6,7.8,46.8,11.9,42.3,9.2,32.3,8.3,27.3,11.4,21.4,25.5,11.4,32.8,7.4,39.1,8.3,45,15.5,58.2,15.1,74,16.4,76.3,22.8,79.5,31.9,79.9,37.3,83.1,45,90.8,53.2,91.7,66.3,80.4,77.2,79,84.5,74.9,85.8,72.7,84.9,57.7,86.3,52.3,91.7,43.2,91.7,35.9,77.7,24.6,71.3,10.1],
+    [33.7,7.8,29.1,9.6,21.4,25.5,10.5,33.2,8.7,35.9,8.3,44.1,15.1,56.8,15.1,73.6,21,79,30.9,79.9,37.8,83.1,45.9,91.3,53.2,91.7,55.9,90.8,66.8,80.4,78.6,78.6,84.5,74.9,86.3,69.1,84.9,57.3,91.7,43.2,91.7,36.4,87.6,31.4,76.8,23.2,73.6,14.2,69.5,8.7,60.9,8.3,47.3,11.9,42.3,9.2],
+    [65.6,7.8,49.3,11.9,37.1,8.3,29.8,9.2,27.1,11.9,20.7,26,12.1,32.3,8,37.3,8.5,45.5,14.8,56.4,15.3,74.5,21.2,79,32.5,80.4,47.5,91.7,54.3,91.3,66.6,80.4,78.4,78.6,82.4,76.8,85.6,72.7,84.7,56.8,86.1,52.3,91.1,45,91.5,36.4,89.2,32.8,77,23.7,73.4,13.7,70.2,9.2],
+    [34.1,7.8,28.2,10.1,21.9,24.6,8.3,35.9,7.8,44.1,14.2,55,14.2,71.3,16,75.9,21.4,79,33.2,80.4,45,90.8,53.2,91.7,65.9,80.8,77.2,79,84,75.4,85.4,71.8,84.9,55,91.7,42.7,91.3,36.4,87.6,31.4,77.7,24.6,72.2,11.4,70,9.2,62.7,7.8,51.4,11.9,46.4,11.9,41.4,9.2],
+    [67.5,8.3,61.6,7.8,48.9,11.9,37.1,8.3,29.8,8.7,25.7,13.7,21.6,24.6,8,36.4,7.6,44.1,13,52.7,14.8,59.5,13.9,71.8,15.8,75.9,20.7,79,33.9,81.3,45.7,91.3,54.3,91.3,66.1,80.4,78.4,78.6,82.9,76.3,85.6,71.8,86.5,65.9,84.2,56.8,91.5,43.2,92,38.2,88.3,32.3,77.4,24.6,72,11.9],
+    [68.1,8.3,58.6,8.7,50.5,11.9,37.3,8.3,30.9,8.7,26.4,12.8,21.4,25.5,11.4,32.8,7.8,37.3,7.8,43.6,15.5,57.7,16,75.9,22.3,79.5,34.6,81.3,46.4,91.3,54.5,91.3,66.3,80.4,77.7,79,83.1,76.3,86.7,70,84.5,57.3,92.2,42.3,92.2,38.7,89,32.8,78.1,25.5,71.8,11.4],
+    [65.4,7.8,50,11.9,36.8,8.3,29.1,9.6,25.5,14.6,21.4,26,11.4,32.8,7.4,39.6,7.8,43.6,15.5,57.7,14.6,70,16,75.4,22.3,79.5,33.7,80.8,47.7,91.7,55.9,90.8,67.7,79.9,79.9,78.1,84.5,75.4,86.7,70.4,84.9,58.2,92.2,42.3,91.3,35.9,89,32.3,78.1,25.1,71.3,10.1],
+    [69.3,8.7,61.6,7.8,51.1,11.9,47.1,11.9,39.8,8.7,32.1,8.3,27.1,11.9,24.4,16.9,23.9,21.9,20.3,26.9,9.4,35,7.6,41.8,15.3,57.7,14.8,72.7,17.1,76.8,22.1,79.5,33,80.4,45.2,90.8,52.9,91.7,67,79.9,77.4,79,84.2,75.4,86.1,72.2,85.2,56.8,92,43.2,92,35.9,89.2,32.8,77.9,25.5,73.4,13.3],
+    [53.2,6.7,48.6,6.7,36.8,14.8,25.1,15.3,20.1,18,16.4,26.6,16,33.4,8.3,42.5,6.5,46.6,6.9,52.5,15.1,63.8,14.6,70.6,16.4,77.9,20.1,81.1,33.7,83.8,45.9,92.9,52.3,92.4,64.1,84.2,77.7,83.3,81.3,78.8,83.6,66.6,92.2,55.7,93.1,52,92.6,48,84,35.3,84,25.7,82.7,21.6,78.6,18.5,63.6,14.8,58.2,9.4],
+    [52.3,6.5,45,9.2,37.3,15.1,25.5,15.5,21.4,17.3,18.2,21.4,15.5,35,6.5,45.9,6.9,52.7,15.1,63.6,16.9,79,25.1,83.1,31.4,83.1,45.5,93.1,51.8,92.6,61.3,85.8,66.8,84.5,72.7,84.9,78.1,83.1,81.3,79,83.1,67.2,93.1,53.2,91.3,46.4,84,35.9,83.1,22.3,79,18.2,70,17.8,63.2,14.6,58.2,9.6],
+    [53.6,6.5,48.6,6.5,36.4,15.1,25.5,15.1,21.4,16.9,18.2,20.5,15.5,34.6,10.1,40,6.5,46.4,7.4,52.3,15.1,63.2,15.1,73.6,16.9,77.7,24.6,82.7,32.3,82.7,43.2,91.3,47.7,93.1,52.7,92.2,60.9,85.4,79.5,82.2,82.7,75.4,83.1,66.8,91.7,56.4,93.1,52.7,92.2,47.3,84.5,35.5,82.7,21.4,79.5,18.2,69.1,16.9,63.6,14.6],
+    [54.1,6.7,48.2,6.7,37.8,14.8,26,15.3,20.1,18.5,17.3,24.4,17.3,31.2,6.5,46.6,6.9,51.6,15.1,63.4,15.1,73.4,17.3,78.8,25.1,82.9,32.8,83.3,45.9,92.9,53.6,92,61.3,85.6,78.6,82.9,82.2,77,83.1,67,91.3,57.5,93.1,52.5,91.3,45.2,85.4,38,84.9,27.5,82.7,21.6,79,18.5,65.4,15.8],
+    [53.9,6.7,48.4,6.7,35.7,15.3,26.2,15.3,21.6,17.1,17.6,22.6,16.7,33,6.2,46.1,6.2,50.2,8.5,54.8,14.4,62,14.8,72.5,17.6,79.3,24.8,82.9,31.6,82.9,45.7,92.9,52.9,92,59.8,86.5,65.2,84.2,71.5,84.7,78.8,82.4,82,78.4,82.9,66.6,93.3,52.9,91.1,45.2,85.6,38.9,84.2,34.4,84.7,27.5,82.4,21.6,79.3,18.5,64.7,15.3],
+    [51.8,6.5,43.2,10.1,35.9,15.5,25.5,15.5,20.5,17.8,17.3,22.8,16.9,32.3,8.3,42.7,6,48.2,8.3,54.5,14.2,63.2,14.6,72.2,17.3,79.5,26,83.1,31.4,83.1,46.4,93.1,52.3,92.6,60,86.3,64.1,84.9,74.9,84.5,78.6,82.7,81.8,77.7,82.2,69.1,93.5,52.3,90.8,45.5,84.9,37.3,84,25.1,82.2,21.4,79,18.7,64.5,15.5,55,7.4],
+    [52,6.2,48.4,6.7,36.2,15.3,25.7,15.3,20.3,18,16.7,23.9,15.8,34.4,7.6,43.4,6.2,47.1,7.1,52.9,14.4,63.4,14.8,73.4,16.7,78.8,23.9,82.4,32.5,83.3,46.6,93.3,53.9,91.5,60.2,86.1,66.1,84.2,74.3,84.2,79.7,81.5,83.3,67,93.3,52,92.9,48.4,84.2,36.2,83.8,24.8,81.1,20.3,78.8,18.5,64.3,15.3,57.9,9.4],
+    [53.2,6.5,47.7,7.4,37.8,15.1,25.1,15.5,21,17.8,16.9,24.1,16.4,33.2,7.8,43.6,6.5,47.7,7.8,53.6,15.1,63.6,16.4,78.6,21,81.8,33.2,83.6,43.6,92.2,46.8,93.1,53.2,92.2,59.1,87.2,65,84.9,74,84.5,79,82.7,81.3,79,83.6,67.2,93.1,53.6,93.1,49.1,84.5,35.9,84.5,26.4,80.8,19.6,67.7,16.9],
+    [54.1,6.5,49.1,6.5,35.9,15.1,25.5,15.1,21,17.3,16.9,25.1,16.4,33.2,10.5,39.6,6.5,46.8,7.4,52.3,15.1,63.2,15.5,73.6,18.2,79.5,23.2,82.2,33.2,83.1,42.7,91.3,47.3,93.1,53.6,91.7,62.2,84.9,73.6,84,79,82.2,83.1,74,84,65.4,93.1,53.2,92.6,47.7,84.9,35.9,84.5,26,80.8,19.2,68.6,16.9],
+    [51.8,6.5,48.6,6.9,37.8,15.1,25.5,15.5,21.4,17.8,18.2,22.3,16.9,32.3,7.4,45,6.5,48.2,7.4,52.7,15.1,63.6,16.9,78.1,22.3,82.2,34.1,84,46.4,93.1,52.3,92.6,64.5,84.9,74.5,84.5,79.5,82.7,82.7,76.3,83.6,66.8,91.7,57.3,93.1,53.6,92.6,48.2,84.5,35,83.6,22.8,79.5,18.7,64.1,15.5,55.4,7.4],
+    [48,7.4,14.8,22.8,11.2,27.3,10.8,32.3,13.5,58.6,16.7,69.1,43,89.5,48.4,92.2,51.6,92.2,57,89.5,83.8,68.1,86.5,56.8,88.8,30.9,87.4,26,84.7,22.8,53.9,7.8],
+    [47.7,7.4,15.1,22.8,11,28.2,11,36.8,13.3,56.8,16.4,69.1,39.6,87.2,50,92.2,56.8,89.5,83.1,69.1,85.8,59.5,88.6,28.2,84.5,22.8,52.7,7.8],
+    [51.6,7.4,45.7,7.8,14.8,22.8,11.2,26.9,12.6,53.2,15.8,68.6,38.9,86.7,48.4,92.2,55.2,90.4,82.4,69.5,85.6,59.1,85.6,50.5,88.3,36.8,88.3,27.8,83.8,22.3],
+    [51.6,7.4,48,7.4,39.3,10.5,13.9,23.2,11.2,28.2,12.1,48.2,15.3,67.2,18.5,71.3,43.4,89.9,48.4,92.2,56.1,89.9,82.9,68.6,84.7,65.4,86.1,48.2,88.3,42.3,88.3,26.9,84.7,22.8],
+    [48.4,7.6,14.8,23.5,11.2,27.1,11.2,34.8,15.3,67.9,43.9,90.1,51.6,92,59.8,87.4,83.3,68.8,87.9,43.9,88.3,28.5,87.4,25.7,80.6,20.7,53.4,8],
+    [48.9,7.6,15.8,22.6,11.7,27.1,11.2,35.3,14.8,65.6,16.7,68.8,43.9,90.1,51.1,92,67.9,81.5,84.2,67.9,87.9,43.9,88.3,27.1,85.6,23.9,77.9,19.4,68.8,16.2,53.4,8],
+    [47.7,7.6,14.2,23.5,11.4,26.6,11,40.7,13.3,48,13.7,60.2,16,68.8,43.6,90.1,51.4,92,60,87.4,83.6,68.4,86.3,58.8,88.6,29.8,87.2,25.3,80.4,20.7,62.2,13,54.1,8],
+    [48.6,7.4,15.1,22.8,11.9,26.4,11,33.2,16,68.6,40.5,87.6,50.5,92.2,65,83.6,84,68.1,86.7,55.4,88.6,30,87.6,25.5,84,22.3,58.6,10.1],
+    [47.5,7.4,14.4,23.2,11.7,26.4,10.8,32.3,13.5,59.1,16.2,68.6,42.5,89.5,50.7,92.2,59.8,87.2,83.8,68.1,86.1,59.1,88.8,28.7,84.2,22.3,53.4,7.8],
+    [48,7.6,14.8,23,12.6,25.3,10.8,30.7,13,55.7,16.2,69.3,44.3,90.6,52.5,92,83.8,68.4,88.8,37.5,88.8,28.5,85.6,23.5,53.4,8],]
+
+BADGE_LABEL_DY = [-3.9,0.7,-2.7,0.7,-1.1,2.4,-3.3,0.1,-1.4,-2.8,-2.8,-2.8,-2.8,-2.8,-2.8,-2.8,-2.8,-2.8,-2.8,2,2,2,2,2,2,2,2,2,2,-0.5,-0.5,-0.5,-0.5,-0.5,-0.5,-0.5,-0.5,-0.5,-0.5,4.5,4.5,4.5,4.5,4.5,4.5,4.5,4.5,4.5,4.5,1.8,1.8,1.8,1.8,1.8,1.8,1.8,1.8,1.8,1.8,1.4,1.4,1.4,1.4,1.4,1.4,1.4,1.4,1.4,1.4,-1.7,-1.7,-1.7,-1.7,-1.7,-1.7,-1.7,-1.7,-1.7,-1.7,0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6,-2.5,-2.5,-2.5,-2.5,-2.5,-2.5,-2.5,-2.5,-2.5,-2.5]
+
+
+def badge_outline(level):
+    """Формы значков уровней 1-99 — контуры, снятые с эталонной картинки (заливка).
+    Уровень 100 использует форму 99."""
+    lv = min(99, max(1, int(level)))
+    flat = BADGE_SHAPES[lv - 1]
+    return ("pts", [(flat[i], flat[i + 1]) for i in range(0, len(flat), 2)])
+
+
+def _rpoly_abs(pts, radii):
+    path = Path()
+    n = len(pts)
+    for i in range(n):
+        p = pts[i]
+        a = pts[(i - 1) % n]
+        b = pts[(i + 1) % n]
+        la = math.hypot(a[0] - p[0], a[1] - p[1])
+        lb = math.hypot(b[0] - p[0], b[1] - p[1])
+        d = min(float(radii[i]), la * 0.5, lb * 0.5)
+        sx, sy = p[0] + (a[0] - p[0]) / la * d, p[1] + (a[1] - p[1]) / la * d
+        ex, ey = p[0] + (b[0] - p[0]) / lb * d, p[1] + (b[1] - p[1]) / lb * d
+        if i == 0:
+            path.moveTo(float(sx), float(sy))
+        else:
+            path.lineTo(float(sx), float(sy))
+        path.quadTo(float(p[0]), float(p[1]), float(ex), float(ey))
+    path.close()
+    return path
+
+
+_PATH_CACHE = {}
+_COND_FACE = []
+
+
+def badge_path(level):
+    lv = min(99, max(1, int(level)))
+    cached = _PATH_CACHE.get(lv)
+    if cached is not None:
+        return cached
+    o = badge_outline(lv)
+    if o[0] == "poly":
+        path = _rpoly_abs(o[1], o[2])
+    else:
+        path = Path()
+        for i, (x, y) in enumerate(o[1]):
+            if i == 0:
+                path.moveTo(float(x), float(y))
+            else:
+                path.lineTo(float(x), float(y))
+        path.close()
+    _PATH_CACHE[lv] = path
+    return path
+
+
+def badge_points(level):
+    """Ломаная для запасного варианта (если Path/Shape недоступны)."""
+    o = badge_outline(level)
+    pts = list(o[1])
+    if o[0] == "pts" and len(pts) > 28:
+        step = max(1, len(pts) // 28)
+        pts = pts[::step]
+    return pts
+
+
+def _label_dy(level):
+    return BADGE_LABEL_DY[min(99, max(1, int(level))) - 1]
+
+
+def _badge_label(ctx, level, size_dp, color, S):
+    big = level < 100
+    t = make_text(ctx, str(level), size_dp * (0.42 if level < 100 else 0.31), color, True, Gravity.CENTER)
+    try:
+        if not _COND_FACE:
+            _COND_FACE.append(Typeface.create("sans-serif-condensed", Typeface.BOLD))
+        t.setTypeface(_COND_FACE[0])
+    except Exception:
+        pass
+    try:
+        t.setIncludeFontPadding(False)
+    except Exception:
+        pass
+    try:
+        t.setTranslationY(float(_label_dy(level) / 100.0 * S))
+    except Exception:
+        pass
+    return t
+
+
+def make_badge(ctx, level, size_dp, color, stroke=6.0, fill=None, ink=None):
+    box = make_badge_parts(ctx, level, size_dp, color, stroke, fill, ink)[0]
+    box.setLayoutParams(lin(dp(size_dp), dp(size_dp)))
+    return box
+
+
+def make_badge_parts_views(ctx, level, size_dp, color, stroke=6.0, fill=None):
+    """Запасной вариант без Path: контур из скруглённых полосок."""
+    S = float(dp(size_dp))
+    T = max(2.0, S * stroke / 100.0)
+    box = FrameLayout(ctx)
+    parts = []
+
+    def add_bar(x1, y1, x2, y2):
+        x1, y1, x2, y2 = x1 * S / 100.0, y1 * S / 100.0, x2 * S / 100.0, y2 * S / 100.0
+        length = math.hypot(x2 - x1, y2 - y1) + T * 0.9
+        v = View(ctx)
+        g = rounded(color, 1)
+        g.setCornerRadius(float(T / 2.0))
+        v.setBackground(g)
+        box.addView(v, frm(int(length), int(T), Gravity.LEFT | Gravity.TOP))
+        v.setTranslationX(float((x1 + x2) / 2.0 - length / 2.0))
+        v.setTranslationY(float((y1 + y2) / 2.0 - T / 2.0))
+        v.setRotation(float(math.degrees(math.atan2(y2 - y1, x2 - x1))))
+        parts.append(g)
+
+    pts = badge_points(level)
+    for i in range(len(pts)):
+        p, q = pts[i], pts[(i + 1) % len(pts)]
+        add_bar(p[0], p[1], q[0], q[1])
+    label = _badge_label(ctx, level, size_dp, color, S)
+    box.addView(label, frm(-1, -1, Gravity.CENTER))
+
+    def recolor(c):
+        try:
+            for g in parts:
+                g.setColor(signed(c))
+            label.setTextColor(signed(c))
+        except Exception as e:
+            log("RichFrog recolor error: " + str(e))
+
+    return box, recolor
+
+
+def _try(fns):
+    last = None
+    for f in fns:
+        try:
+            return f()
+        except Exception as e:
+            last = e
+    raise last
+
+
+def _shape_alt(path):
+    sd = ShapeDrawable()
+    sd.setShape(PathShape(path, 100.0, 100.0))
+    return sd
+
+
+def _new_shape(level):
+    path = badge_path(level)
+    return _try([lambda: ShapeDrawable(PathShape(path, 100.0, 100.0)), lambda: _shape_alt(path)])
+
+
+def make_badge_parts(ctx, level, size_dp, color, stroke=6.0, fill=None, ink=None):
+    """Значок уровня: сплошная заливка формы (ShapeDrawable+PathShape) цветом color и цифра
+    цветом ink (как на эталонной картинке). Если ink не задан — старый контурный вариант.
+    Без тостов: при ошибке тихо уходим на запасной вариант."""
+    stage = "init"
+    filled = ink is not None
+    try:
+        S = float(dp(size_dp))
+        box = FrameLayout(ctx)
+        if fill is not None and not filled:
+            stage = "fill"
+            fshape = _new_shape(level)
+            fshape.getPaint().setColor(signed(fill))
+            fv = View(ctx)
+            fv.setBackground(fshape)
+            box.addView(fv, frm(-1, -1))
+        stage = "shape"
+        shape = _new_shape(level)
+        stage = "paint"
+        paint = shape.getPaint()
+        if filled:
+            _try([lambda: paint.setStyle(Paint.Style.FILL),
+                  lambda: paint.setStyle(jclass("android.graphics.Paint$Style").FILL)])
+        else:
+            _try([lambda: paint.setStyle(Paint.Style.STROKE),
+                  lambda: paint.setStyle(jclass("android.graphics.Paint$Style").STROKE)])
+        paint.setStrokeWidth(float(stroke))
+        for f in (lambda: paint.setAntiAlias(True),
+                  lambda: paint.setStrokeJoin(Paint.Join.ROUND),
+                  lambda: paint.setStrokeCap(Paint.Cap.ROUND)):
+            try:
+                f()
+            except Exception:
+                pass
+        paint.setColor(signed(color))
+        stage = "views"
+        art = View(ctx)
+        art.setBackground(shape)
+        label = _badge_label(ctx, level, size_dp, ink if filled else color, S)
+        box.addView(art, frm(-1, -1))
+        box.addView(label, frm(-1, -1, Gravity.CENTER))
+
+        def recolor(c):
+            try:
+                paint.setColor(signed(c))
+                shape.invalidateSelf()
+                art.invalidate()
+                if not filled:
+                    label.setTextColor(signed(c))
+            except Exception as e:
+                log("RichFrog recolor error: " + str(e))
+
+        return box, recolor
+    except Exception as e:
+        if not getattr(make_badge_parts, "_logged", False):
+            make_badge_parts._logged = True
+            log("RichFrog badge fallback at %s: %s" % (stage, e))
+        return make_badge_parts_views(ctx, level, size_dp, color, stroke, fill)
+
+
+def make_slider(ctx, accent, track, maximum, progress, on_change):
+    sb = SeekBar(ctx)
+    sb.setMax(int(maximum))
+    try:
+        _style_slider(ctx, sb, accent, track)
+    except Exception as e:
+        log("RichFrog slider style fallback: " + str(e))
+    sb.setProgress(int(progress))
+    sb.setOnSeekBarChangeListener(_Seek(on_change))
+    return sb
+
+
+def _style_slider(ctx, sb, accent, track):
+    bg = rounded(track, 4)
+    bg.setSize(-1, dp(8))
+    fg = rounded(accent, 4)
+    fg.setSize(-1, dp(8))
+    clip = ClipDrawable(fg, Gravity.LEFT, ClipDrawable.HORIZONTAL)
+    layers = LayerDrawable(jarray(Drawable)([bg, clip]))
+    rid = jclass("android.R$id")
+    layers.setId(0, rid.background)
+    layers.setId(1, rid.progress)
+    thumb = rounded(accent, 2)
+    thumb.setSize(dp(4), dp(30))
+    sb.setProgressDrawable(layers)
+    sb.setThumb(thumb)
+    sb.setThumbOffset(0)
+    sb.setSplitTrack(False)
+    sb.setBackground(None)
+    sb.setPadding(dp(16), 0, dp(16), 0)
+
+
+# ======================================================================
+# Хуки
+# ======================================================================
+class GetUserFullHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin.apply_identity(soft=True)
+        except Exception:
+            pass
+        try:
+            self.plugin.apply_worn()
+        except Exception:
+            pass
+        try:
+            if not self.plugin.acc_enabled():
+                return
+            full = param.getResult()
+            if full is None or int(param.args[0]) != my_id():
+                return
+            self.plugin.apply_rating(full)
+        except Exception as e:
+            log("RichFrog getUserFull error: " + str(e))
+
+
+class UserFullArgHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            self.plugin.apply_identity(soft=True)
+        except Exception:
+            pass
+        try:
+            self.plugin.apply_worn()
+        except Exception:
+            pass
+        try:
+            if not self.plugin.acc_enabled():
+                return
+            flat = []
+            for a in param.args:
+                flat.append(a)
+                try:
+                    if a is not None and not hasattr(a, "stars_rating"):
+                        for x in a:
+                            flat.append(x)
+                except Exception:
+                    pass
+            for arg in flat:
+                if arg is None or not hasattr(arg, "stars_rating"):
+                    continue
+                try:
+                    if int(arg.id) == my_id():
+                        self.plugin.apply_rating(arg)
+                except Exception:
+                    continue
+        except Exception as e:
+            log("RichFrog arg hook error: " + str(e))
+
+
+class ProfileHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            self.plugin.apply_identity(soft=True)
+        except Exception:
+            pass
+        try:
+            self.plugin.apply_worn()
+        except Exception:
+            pass
+        try:
+            if not self.plugin.acc_enabled():
+                return
+            try:
+                self.plugin.reinject()
+            except Exception:
+                pass
+            obj = param.thisObject
+            f = obj.getClass().getDeclaredField("userInfo")
+            f.setAccessible(True)
+            info = f.get(obj)
+            if info is not None and int(info.id) == my_id():
+                self.plugin.apply_rating(info)
+        except Exception as e:
+            log("RichFrog profile hook error: " + str(e))
+
+
+class SaveGuardHook(MethodHook):
+    """UserConfig.saveConfig: на время записи на диск возвращаем настоящие username/номер."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if self.plugin._id_dirty:
+                self.plugin.apply_identity(restore=True)
+                self.plugin._id_dirty = True
+        except Exception:
+            pass
+
+    def after_hooked_method(self, param):
+        try:
+            if self.plugin._id_dirty:
+                self.plugin.apply_identity()
+        except Exception:
+            pass
+
+
+_NULL_DEL = []
+
+
+def _null_delegate():
+    if not _NULL_DEL:
+        rd = jclass("org.telegram.tgnet.RequestDelegate")
+
+        class _ND(dynamic_proxy(rd)):
+            def run(self, response, error):
+                pass
+
+        _NULL_DEL.append(_ND())
+    return _NULL_DEL[0]
+
+
+class CollectibleHook(MethodHook):
+    """Запрос account.getCollectibleInfo по нашему username -> отвечаем «куплен за 10 TON».
+    Отвечаем ровно один раз: повторные вызовы (соседние перегрузки sendRequest) глушатся,
+    а настоящий запрос к серверу не уходит."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def _mute(self, param, idx):
+        """Подменяем делегат на пустой — даже если setResult не сработает, ответ сервера никуда не пойдёт."""
+        if idx is None:
+            return
+        try:
+            cls = jclass("java.lang.Class").forName("org.telegram.tgnet.RequestDelegate")
+            if cls.isInstance(param.args[idx]):
+                param.args[idx] = _null_delegate()
+        except Exception:
+            pass
+
+    def before_hooked_method(self, param):
+        try:
+            p = self.plugin
+            if not p._any_unames:
+                return
+            req = param.args[0]
+            if req is None:
+                return
+            if "getcollectibleinfo" not in str(req.getClass().getSimpleName()).lower():
+                return
+            coll = getattr(req, "collectible", None)
+            uname = getattr(coll, "username", None) if coll is not None else None
+            if not uname:
+                return
+            item = p.find_username(str(uname))
+            if item is None:
+                return
+            low = str(uname).lower()
+            now = time.time()
+            rid = _ih(req)
+            answered = (now - p._coll_last.get(low, 0.0) < 3.0) or (rid in p._coll_seen)
+            if len(p._coll_seen) > 30:
+                p._coll_seen.clear()
+            p._coll_seen[rid] = now
+            idx = None
+            delegate = None
+            for i, a in enumerate(list(param.args)):
+                if i > 0 and a is not None and hasattr(a, "run"):
+                    idx, delegate = i, a
+                    break
+            if not answered:
+                resp = p.build_collectible_info(item)
+                if resp is None or delegate is None:
+                    return
+                p._coll_last[low] = now
+                run_on_ui_thread(lambda: delegate.run(resp, None))
+                log("RichFrog collectible answered: " + str(uname))
+            self._mute(param, idx)
+            param.setResult(0)
+        except Exception as e:
+            log("RichFrog collectible hook error: " + str(e))
+
+
+class EmojiStatusHook(MethodHook):
+    """account.updateEmojiStatus на НАШ добавленный NFT: сервер про него не знает, поэтому отвечаем
+    успехом сами и запоминаем, что он надет. Любая другая смена статуса (убрать, другой NFT, эмодзи)
+    снимает «ношу» - значит, статус висит, пока ты сам его не уберёшь или не заменишь."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            p = self.plugin
+            req = param.args[0]
+            if req is None:
+                return
+            if "updateemojistatus" not in str(req.getClass().getSimpleName()).lower():
+                return
+            st = getattr(req, "emoji_status", None)
+            cid = None
+            try:
+                v = getattr(st, "collectible_id", None)
+                cid = int(v) if v is not None else None
+            except Exception:
+                cid = None
+            fake = p.fake_unique_by_id(cid) if cid else None
+            if fake is None:
+                if p.worn_id():
+                    p.clear_worn()
+                return
+            idx, delegate = None, None
+            for i, a in enumerate(list(param.args)):
+                if i > 0 and a is not None and hasattr(a, "run"):
+                    idx, delegate = i, a
+                    break
+            now = time.time()
+            first = (now - p._worn_last) > 1.5
+            p._worn_last = now
+            if first:
+                p.set_worn(cid)
+                resp = None
+                try:
+                    resp = find_class("org.telegram.tgnet.TLRPC$TL_boolTrue")()
+                except Exception:
+                    resp = None
+
+                def answer():
+                    try:
+                        p.apply_worn()
+                        if delegate is not None and resp is not None:
+                            delegate.run(resp, None)
+                        p.apply_worn()
+                        p.notify_status()
+                    except Exception as e:
+                        log("RichFrog worn answer error: " + str(e))
+
+                run_on_ui_thread(answer)
+                log("RichFrog worn NFT set: " + str(cid))
+            if idx is not None:
+                try:
+                    cls = jclass("java.lang.Class").forName("org.telegram.tgnet.RequestDelegate")
+                    if cls.isInstance(param.args[idx]):
+                        param.args[idx] = _null_delegate()
+                except Exception:
+                    pass
+            param.setResult(0)
+        except Exception as e:
+            log("RichFrog emoji status hook error: " + str(e))
+
+
+class UniqueGiftHook(MethodHook):
+    """payments.getUniqueStarGift(slug): клиент перезапрашивает подарок по ссылке и получал НАСТОЯЩИЙ
+    NFT с тем же номером. Если slug наш - отвечаем нашим подарком, на сервер запрос не уходит."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            p = self.plugin
+            req = param.args[0]
+            if req is None:
+                return
+            name = str(req.getClass().getSimpleName()).lower()
+            if not name.endswith("getuniquestargift"):
+                return
+            slug = str(getattr(req, "slug", "") or "")
+            g = p.fake_unique_by_slug(slug)
+            if g is None:
+                return
+            idx, delegate = None, None
+            for i, a in enumerate(list(param.args)):
+                if i > 0 and a is not None and hasattr(a, "run"):
+                    idx, delegate = i, a
+                    break
+            now = time.time()
+            low = slug.lower()
+            first = (now - p._uq_last.get(low, 0.0)) > 1.5
+            p._uq_last[low] = now
+            if first and delegate is not None:
+                resp = p.build_unique_response(g)
+                if resp is None:
+                    return
+                run_on_ui_thread(lambda: delegate.run(resp, None))
+                log("RichFrog unique gift answered locally: " + slug)
+            if idx is not None:
+                try:
+                    cls = jclass("java.lang.Class").forName("org.telegram.tgnet.RequestDelegate")
+                    if cls.isInstance(param.args[idx]):
+                        param.args[idx] = _null_delegate()
+                except Exception:
+                    pass
+            param.setResult(0)
+        except Exception as e:
+            log("RichFrog unique gift hook error: " + str(e))
+
+
+class UserPutHook(MethodHook):
+    """MessagesController.putUser/putUsers: пришедший с сервера объект себя без статуса - возвращаем «ношу»."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if not self.plugin._worn_any:
+                return
+            self.plugin.apply_worn_to(param.args)
+        except Exception as e:
+            log("RichFrog user put hook error: " + str(e))
+
+
+class GiftsListResultHook(MethodHook):
+    """StarsController.getProfileGiftsList(...) -> подмешиваем наши подарки."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            res = param.getResult()
+            if res is not None:
+                self.plugin.inject_into_list(res)
+        except Exception as e:
+            log("RichFrog gifts list hook error: " + str(e))
+
+
+class ProfileNotifyHook(MethodHook):
+    """ProfileActivity.didReceivedNotification: список подарков мог перезагрузиться с сервера -
+    возвращаем наши подарки до того, как профиль его прочитает."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            self.plugin.reinject(True)
+        except Exception as e:
+            log("RichFrog profile notify hook: " + str(e))
+
+
+class NotifyHook(MethodHook):
+    """NotificationCenter.postNotificationName: когда список подарков загружен,
+    добавляем наши подарки до того, как UI его прочитает."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            ids = self.plugin.gift_notif_ids
+            if not ids:
+                return
+            if int(param.args[0]) not in ids:
+                return
+            for a in param.args[1:]:
+                items = [a]
+                try:
+                    if not hasattr(a, "gifts"):
+                        items = list(a)
+                except Exception:
+                    pass
+                for it in items:
+                    if it is not None and hasattr(it, "gifts"):
+                        self.plugin.inject_into_list(it)
+        except Exception as e:
+            log("RichFrog notify hook error: " + str(e))
+
+
+# ======================================================================
+# Плагин
+# ======================================================================
+class RichFrogLitePlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.menu_item_id = None
+        self.rating_cls = None
+        self.gift_notif_ids = set()
+        self._tl_cache = {}
+        self._tl_raw = {}
+        self._fakes = {}            # uid -> [(saved_id, SavedStarGift, meta)]
+        self._bumped = {}           # uid -> (значение счётчика, сколько добавили)
+        self._failed = {}           # uid -> сохранённые подарки, которые не удалось прочитать
+        self._load_warned = False
+        self._retry_t = {}
+        self._retry_n = {}
+        self._uq_last = {}
+        self._worn_obj = {}         # uid -> (id надетого NFT, объект EmojiStatus)
+        self._worn_any = False
+        self._worn_last = 0.0
+        self._lists = []
+        self._idstate = {}
+        self._cfg_cache = {}
+        self._un_cache = {}
+        self._id_dirty = False
+        self._id_last = 0.0
+        self._any_unames = False
+        self._coll_last = {}
+        self._coll_seen = {}
+        self._stats = {}
+        self._live = []
+        self._pending_input = False
+        self._has_input = False
+        self._kb_t = 0.0
+        self._kb_poll_id = 0
+        self._bk_pending = False
+        self._restoring = False
+        self._sheet = None
+        self._sheet_wrap = None
+        self._sheet_bottom = False
+        self.catalog = []
+        for name in RATING_CLASSES:
+            try:
+                self.rating_cls = find_class(name)
+                if self.rating_cls:
+                    break
+            except Exception:
+                continue
+        try:
+            mc = find_class("org.telegram.messenger.MessagesController")
+            self.hook_all_methods(mc, "getUserFull", GetUserFullHook(self))
+            for name in ("processUserInfo", "putUserFull", "loadFullUser"):
+                try:
+                    self.hook_all_methods(mc, name, UserFullArgHook(self))
+                except Exception as e:
+                    log("RichFrog skip hook %s: %s" % (name, e))
+        except Exception as e:
+            log("RichFrog load error: " + str(e))
+        try:
+            pa = find_class("org.telegram.ui.ProfileActivity")
+            for name in ("updateProfileData", "updateListAnimated", "didReceivedNotification"):
+                try:
+                    hook = UserFullArgHook(self) if name == "didReceivedNotification" else ProfileHook(self)
+                    self.hook_all_methods(pa, name, hook)
+                    if name == "didReceivedNotification":
+                        self.hook_all_methods(pa, name, ProfileNotifyHook(self))
+                except Exception as e:
+                    log("RichFrog skip profile hook %s: %s" % (name, e))
+        except Exception as e:
+            log("RichFrog profile load error: " + str(e))
+        self._hook_gifts()
+        try:
+            uc = find_class("org.telegram.messenger.UserConfig")
+            self.hook_all_methods(uc, "saveConfig", SaveGuardHook(self))
+        except Exception as e:
+            log("RichFrog saveConfig hook: " + str(e))
+        # Lite build: do not hook ConnectionsManager.sendRequest.
+        # This is Telegram's global network path; intercepting every request can
+        # add latency to chats, message history, media and profile operations.
+        try:
+            mc2 = find_class("org.telegram.messenger.MessagesController")
+            for name in ("putUser", "putUsers"):
+                try:
+                    self.hook_all_methods(mc2, name, UserPutHook(self))
+                except Exception as e:
+                    log("RichFrog skip hook %s: %s" % (name, e))
+        except Exception as e:
+            log("RichFrog put user hooks: " + str(e))
+        self._maybe_auto_restore()
+        self._refresh_flags()
+        self._refresh_worn_flag()
+        self._warmup_gifts()
+        log("RichFrog loaded")
+
+    def _warmup_gifts(self):
+        # Lite build: no repeated UI-thread reinjection during app startup.
+        # Gifts are injected lazily when the relevant profile/list is opened.
+        return
+
+    def _hook_gifts(self):
+        try:
+            sc = find_class("org.telegram.ui.Stars.StarsController")
+            for name in ("getProfileGiftsList",):
+                try:
+                    self.hook_all_methods(sc, name, GiftsListResultHook(self))
+                except Exception as e:
+                    log("RichFrog skip gifts hook %s: %s" % (name, e))
+        except Exception as e:
+            log("RichFrog StarsController not found: " + str(e))
+        try:
+            from java.lang import Class
+            ncc = Class.forName("org.telegram.messenger.NotificationCenter")
+            for f in ncc.getDeclaredFields():
+                n = str(f.getName()).lower()
+                if "giftsloaded" in n or "usergifts" in n or ("gifts" in n and "load" in n):
+                    try:
+                        f.setAccessible(True)
+                        self.gift_notif_ids.add(int(f.getInt(None)))
+                    except Exception:
+                        pass
+            self.hook_all_methods(find_class("org.telegram.messenger.NotificationCenter"),
+                                  "postNotificationName", NotifyHook(self))
+            log("RichFrog gift notification ids: " + str(sorted(self.gift_notif_ids)))
+        except Exception as e:
+            log("RichFrog notification hook error: " + str(e))
+
+    # ---------- рейтинг ----------
+    def discover_rating_class(self, full):
+        try:
+            field_type = full.getClass().getField("stars_rating").getType()
+            if not field_type.isInterface() and not java_abstract(field_type):
+                return jclass(field_type.getName())
+            outer = field_type.getDeclaringClass()
+            candidates = list(outer.getDeclaredClasses()) if outer is not None else []
+            for c in candidates:
+                if c.getSuperclass() is not None and c.getSuperclass().getName() == field_type.getName() \
+                        and not java_abstract(c):
+                    return jclass(c.getName())
+        except Exception as e:
+            log("RichFrog discover error: " + str(e))
+        return None
+
+    # ---------- настройки отдельно для каждого аккаунта ----------
+    def uid(self):
+        try:
+            return my_id()
+        except Exception:
+            return 0
+
+    def _migrate(self):
+        """Старые общие настройки (до 2.1) переезжают на текущий аккаунт один раз."""
+        try:
+            if self.get_setting("legacy_migrated", False):
+                return
+            uid = self.uid()
+            if not uid:
+                return
+            for name in ("level", "points", "enabled", "gifts_json", "gifts_enabled"):
+                val = self.get_setting(name, None)
+                if val is not None:
+                    self.set_setting("%s_%d" % (name, uid), val)
+            self.set_setting("legacy_migrated", True)
+        except Exception as e:
+            log("RichFrog migrate error: " + str(e))
+
+    def acc_key(self, name):
+        return "%s_%d" % (name, self.uid())
+
+    def acc_get(self, name, default):
+        self._migrate()
+        return self.get_setting(self.acc_key(name), default)
+
+    def acc_set(self, name, value):
+        self.set_setting(self.acc_key(name), value)
+        self._cfg_cache.clear()
+        self._un_cache.clear()
+        self._auto_backup()
+
+    def acc_enabled(self):
+        return bool(self.acc_get("enabled", True))
+
+    def gifts_on(self):
+        return bool(self.acc_get("gifts_enabled", True))
+
+    def get_level(self):
+        return min(MAX_LEVEL, max(1, to_int(self.acc_get("level", "1"), 1)))
+
+    def get_points(self):
+        return max(0, to_int(self.acc_get("points", "0"), 0))
+
+    def apply_rating(self, full):
+        level = self.get_level()
+        points = self.get_points()
+        rating = getattr(full, "stars_rating", None)
+        if rating is None:
+            if self.rating_cls is None:
+                self.rating_cls = self.discover_rating_class(full)
+            if self.rating_cls is None:
+                return
+            rating = self.rating_cls()
+            full.stars_rating = rating
+        full.flags2 = full.flags2 | 131072
+        rating.flags = rating.flags | 1
+        rating.level = level
+        rating.stars = points
+        rating.current_level_stars = level_threshold(level)
+        rating.next_level_stars = level_threshold(level + 1)
+        self._bump_gift_count(full)
+
+    def _bump_gift_count(self, full):
+        try:
+            if not hasattr(full, "stargifts_count"):
+                return
+            uid = self.uid()
+            n = len(self.fakes()) if self.gifts_on() else 0
+            base = int(full.stargifts_count)
+            rec = self._bumped.get(uid)
+            if rec is not None and base == rec[0]:
+                # этот объект уже содержит нашу прибавку - вычитаем её и считаем заново
+                base = rec[0] - rec[1]
+                if rec[1] == n:
+                    return
+            if n <= 0:
+                if rec is not None:
+                    full.stargifts_count = base
+                    self._bumped.pop(uid, None)
+                return
+            new = base + n
+            full.stargifts_count = new
+            self._bumped[uid] = (new, n)
+            if base == 0:
+                full.flags2 = full.flags2 | 256
+        except Exception as e:
+            log("RichFrog gift count error: " + str(e))
+
+    def refresh_profile(self):
+        try:
+            from org.telegram.messenger import MessagesController, UserConfig
+            acc = UserConfig.selectedAccount
+            mc = MessagesController.getInstance(acc)
+            user = mc.getUser(my_id())
+            if user is not None:
+                mc.loadFullUser(user, 0, True)
+        except Exception as e:
+            log("RichFrog refresh error: " + str(e))
+
+    # ---------- уведомления ----------
+    def toast(self, text):
+        _show_toast(text)
+
+    def activity(self):
+        try:
+            fr = get_last_fragment()
+            act = fr.getParentActivity() if fr is not None else None
+            if act is not None:
+                return act
+        except Exception:
+            pass
+        from org.telegram.messenger import ApplicationLoader
+        return ApplicationLoader.applicationContext
+
+    # ---------- шторки ----------
+    def _dismiss_now(self):
+        d = self._sheet
+        self._sheet = None
+        self._sheet_wrap = None
+        try:
+            if d is not None:
+                d.dismiss()
+        except Exception:
+            pass
+
+    def _sheet_alive(self):
+        try:
+            return self._sheet is not None and bool(self._sheet.isShowing())
+        except Exception:
+            return False
+
+    def _on_dismissed(self, d):
+        """Шторку закрыли чем угодно (кнопка «назад», тап снаружи) — забываем её, чтобы следующая открылась."""
+        try:
+            if self._sheet is not None and self._sheet == d:
+                self._sheet = None
+                self._sheet_wrap = None
+        except Exception:
+            pass
+        try:
+            if d in self._live:
+                self._live.remove(d)
+        except Exception:
+            pass
+
+    def _kb_tick(self, wrap, pid):
+        """Пока в шторке есть поле ввода — следим за клавиатурой и поднимаем шторку над ней
+        (работает и если окно диалога не ужимается системой)."""
+        try:
+            if pid != self._kb_poll_id or self._sheet_wrap is None or not self._has_input or self._sheet_closing:
+                return
+            from android.graphics import Rect
+            rect = Rect()
+            wrap.getRootView().getWindowVisibleDisplayFrame(rect)
+            loc = jarray(jint)([0, 0])
+            wrap.getLocationOnScreen(loc)
+            hh = int(wrap.getHeight())
+            ty = float(wrap.getTranslationY())
+            base_bottom = float(loc[1]) + hh - ty
+            outer = wrap.getParent()
+            oh = int(outer.getHeight())
+            oloc = jarray(jint)([0, 0])
+            outer.getLocationOnScreen(oloc)
+            outer_bottom = float(oloc[1] + oh)
+            dm = self.activity().getResources().getDisplayMetrics()
+            resized = oh < int(dm.heightPixels) - dp(120)
+            kb_top = float(rect.bottom)
+            if not resized and kb_top >= outer_bottom - dp(60):
+                try:   # запасной путь: высота клавиатуры из оконных инсетов (Android 11+)
+                    wi = wrap.getRootWindowInsets()
+                    ime = int(wi.getInsets(jclass("android.view.WindowInsets$Type").ime()).bottom) if wi is not None else 0
+                    if ime > dp(80):
+                        kb_top = outer_bottom - ime
+                except Exception:
+                    pass
+            lift = max(0.0, base_bottom - (kb_top - dp(10)))
+            target = -lift
+            if abs(target - self._kb_t) > dp(3):
+                self._kb_t = target
+                wrap.animate().setStartDelay(0).translationY(float(target)).setDuration(260).setInterpolator(
+                    emph_dec()).setUpdateListener(_AnimUpdate(lambda f: self._sheet_light())).start()
+        except Exception as e:
+            log("RichFrog kb tick: " + str(e))
+        try:
+            wrap.postDelayed(_Runner(lambda: self._kb_tick(wrap, pid)), 90)
+        except Exception:
+            pass
+
+    def _start_kb_poll(self, wrap):
+        self._kb_poll_id += 1
+        pid = self._kb_poll_id
+        self._kb_t = 0.0
+        wrap.postDelayed(_Runner(lambda: self._kb_tick(wrap, pid)), 500)
+
+    def _hide_kb(self):
+        try:
+            sv = getattr(self, "_sheet_sv", None)
+            if sv is not None:
+                self.activity().getSystemService("input_method").hideSoftInputFromWindow(sv.getWindowToken(), 0)
+        except Exception:
+            pass
+
+    def _safe_dismiss(self, d):
+        try:
+            if d.isShowing():
+                d.dismiss()
+        except Exception:
+            pass
+
+    def _kill_stale(self, keep=None):
+        """Убираем все «зависшие» окна шторок: невидимое окно поверх экрана глотает все нажатия."""
+        for d in list(self._live):
+            try:
+                if keep is not None and d == keep:
+                    continue
+                self._safe_dismiss(d)
+                self._live.remove(d)
+            except Exception:
+                pass
+
+    def _fit_height(self, content, height, max_height):
+        """Высота шторки: фикс. доля экрана, либо по содержимому (но не выше max_height)."""
+        dm = self.activity().getResources().getDisplayMetrics()
+        if height:            return int(dm.heightPixels * height)
+        if max_height:
+            try:
+                content.measure(View.MeasureSpec.makeMeasureSpec(int(dm.widthPixels), View.MeasureSpec.EXACTLY),
+                                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED))
+                cap = int(dm.heightPixels * max_height)
+                if int(content.getMeasuredHeight()) > cap:
+                    return cap
+            except Exception as e:
+                log("RichFrog fit height: " + str(e))
+        return None
+
+    def _dim(self, w, a, b, dur):
+        try:
+            va = ValueAnimator.ofFloat(0.0, 1.0)
+            va.setDuration(int(dur))
+            va.addUpdateListener(_AnimUpdate(lambda f: w.setDimAmount(float(a + (b - a) * f))))
+            va.start()
+        except Exception as e:
+            log("RichFrog dim error: " + str(e))
+
+    def _snapshot_backdrop(self):
+        """Маленький снимок экрана под шторкой (сильно сжатый = уже размытый)."""
+        try:
+            from android.graphics import Bitmap, Canvas
+            decor = self.activity().getWindow().getDecorView()
+            w, h = int(decor.getWidth()), int(decor.getHeight())
+            sc = 28
+            bw, bh = max(2, w // sc), max(2, h // sc)
+            bmp = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
+            cv = Canvas(bmp)
+            cv.scale(float(bw) / w, float(bh) / h)
+            decor.draw(cv)
+            return bmp, float(w), float(h)
+        except Exception as e:
+            log("RichFrog snapshot: " + str(e))
+            return None
+
+    def _sheet_light(self, wrap=None):
+        try:
+            wrap = wrap or self._sheet_wrap
+            parts = getattr(self, "_sheet_parts", None)
+            if wrap is None or not parts:
+                return
+            dm = self.activity().getResources().getDisplayMetrics()
+            sh = float(dm.heightPixels)
+            hh = float(wrap.getHeight() or 1)
+            ty = float(wrap.getTranslationY())
+            info = parts.get("bdinfo")
+            if info:
+                top = sh - hh - float(dp(SHEET_BOTTOM)) + ty   # где сейчас верх шторки на экране
+                backdrop_move(info, top * (info["H"] / sh))
+            light_apply(parts, max(0.0, min(1.0, ty / max(1.0, hh))), None)
+        except Exception as e:
+            log("RichFrog sheet light: " + str(e))
+
+    def close_sheet(self, animate=True):
+        d = self._sheet
+        wrap = getattr(self, "_sheet_wrap", None)
+        if d is None:
+            return
+        if not animate or wrap is None:
+            self._dismiss_now()
+            return
+        self._hide_kb()
+        self._kb_poll_id += 1
+        self._sheet_closing = True
+        self._sheet = None
+        self._sheet_wrap = None
+        try:
+            dm = self.activity().getResources().getDisplayMetrics()
+            a = wrap.animate().setStartDelay(0).setDuration(260).setInterpolator(emph_acc())
+            if getattr(self, "_sheet_bottom", False):
+                a = a.translationY(float(dm.heightPixels))
+                self._dim(d.getWindow(), 0.38, 0.0, 260)
+            else:
+                a = a.translationX(float(dm.widthPixels))
+            try:
+                a.setUpdateListener(_AnimUpdate(lambda f: self._sheet_light(wrap)))
+            except Exception:
+                pass
+            a.withEndAction(_Runner(lambda: self._safe_dismiss(d))).start()
+            # страховка: если анимацию отменили (например, тронули ручку), окно всё равно уберётся
+            wrap.postDelayed(_Runner(lambda: self._safe_dismiss(d)), 480)
+        except Exception as e:
+            log("RichFrog close anim error: " + str(e))
+            try:
+                d.dismiss()
+            except Exception:
+                pass
+
+    def show_sheet(self, content, bottom=False, height=None, max_height=None):
+        """Dialog: стеклянная шторка выезжает с мягким перелётом, контент появляется каскадом,
+        шторку можно утянуть вниз за ручку; страницы сдвигаются справа."""
+        had_sheet = self._sheet_alive()
+        if not had_sheet:
+            self._sheet = None
+        if had_sheet and bottom and self._sheet_bottom and getattr(self, "_sheet_sv", None) is not None:
+            # шторка уже открыта: меняем содержимое на месте, без нового Dialog (быстро, без лагов)
+            try:
+                self._hide_kb()
+                self._has_input = bool(self._pending_input)
+                self._pending_input = False
+                self._kb_poll_id += 1
+                self._kb_t = 0.0
+                try:
+                    self._sheet_wrap.animate().setStartDelay(0).translationY(0.0).setDuration(220).start()
+                except Exception:
+                    pass
+                if self._has_input:
+                    self._start_kb_poll(self._sheet_wrap)
+                dm1 = self.activity().getResources().getDisplayMetrics()
+                sv = self._sheet_sv
+                sv.removeAllViews()
+                sv.addView(content)
+                sv.scrollTo(0, 0)
+                lp = self._sheet_wrap.getLayoutParams()
+                fit = self._fit_height(content, height, max_height)
+                lp.height = fit if fit else -2
+                self._sheet_wrap.setLayoutParams(lp)
+                content.setAlpha(0.0)
+                content.setTranslationX(float(dp(28)))
+                content.animate().alpha(1.0).translationX(0.0).setDuration(300).setInterpolator(std_ease()).start()
+                return
+            except Exception as e:
+                log("RichFrog sheet swap fallback: " + str(e))
+        self._dismiss_now()
+        self._kill_stale()
+        ctx = self.activity()
+        C = theme_colors()
+        dm0 = ctx.getResources().getDisplayMetrics()
+        hpx = self._fit_height(content, height, max_height)
+        sheet_solid = signed(0xFF0A0A0B)
+        from android.app import Dialog
+        from android.graphics.drawable import ColorDrawable
+        rs = jclass("android.R$style")
+        d = Dialog(ctx, rs.Theme_Translucent_NoTitleBar if bottom else rs.Theme_Black_NoTitleBar)
+        sv = ScrollView(ctx)
+        sv.setFillViewport(not bottom)
+        sv.setOverScrollMode(View.OVER_SCROLL_NEVER)
+        try:
+            sv.setClipChildren(False)
+            sv.setClipToPadding(False)
+            content.setClipChildren(False)
+        except Exception:
+            pass
+        sv.addView(content)
+        wrap = FrameLayout(ctx)
+        wrap.setClickable(True)
+        if bottom:
+            _bg, _parts = sheet_bg_parts(self._snapshot_backdrop())
+            wrap.setBackground(_bg)
+            self._sheet_parts = _parts
+        else:
+            wrap.setBackgroundColor(sheet_solid)
+        wrap.addView(sv, frm(-1, -1 if (hpx or not bottom) else -2))
+        if bottom:
+            handle = FrameLayout(ctx)
+            grip = View(ctx)
+            grip.setBackground(rounded(0x99FFFFFF, 3))
+            handle.addView(grip, frm(dp(40), dp(5), Gravity.CENTER_HORIZONTAL | Gravity.TOP, (0, 9, 0, 0)))
+            handle.setOnTouchListener(_Drag(self, wrap))
+            wrap.addView(handle, frm(-1, dp(32), Gravity.TOP))
+            outer = FrameLayout(ctx)
+            on_click(outer, lambda v: self.close_sheet(), False)
+            outer.addView(wrap, frm(-1, hpx if hpx else -2, Gravity.BOTTOM, (SHEET_SIDE, 0, SHEET_SIDE, SHEET_BOTTOM)))
+            outer.addOnLayoutChangeListener(_KbLayout(self, wrap))
+            self._sheet_closing = False
+            self._open_t = time.time()
+            d.setContentView(outer)
+        else:
+            d.setContentView(wrap)
+        w = d.getWindow()
+        if bottom:
+            w.setBackgroundDrawable(ColorDrawable(0))
+            w.setLayout(-1, -1)
+            w.addFlags(2)
+            w.setDimAmount(0.38 if had_sheet else 0.0)
+            try:
+                # iOS-размытие фона за шторкой (Android 12+, если включено в системе)
+                w.addFlags(4)
+                w.setBackgroundBlurRadius(int(dp(26)))
+                at = w.getAttributes()
+                at.setBlurBehindRadius(int(dp(18)))
+                w.setAttributes(at)
+            except Exception as e:
+                log("RichFrog blur unavailable: " + str(e))
+        else:
+            w.setBackgroundDrawable(ColorDrawable(sheet_solid))
+            w.setLayout(-1, -1)
+        w.setSoftInputMode(16)
+        dm = ctx.getResources().getDisplayMetrics()
+        if bottom:
+            wrap.setTranslationY(0.0 if had_sheet else float(dm.heightPixels))
+        else:
+            wrap.setTranslationX(float(dm.widthPixels))
+        try:
+            d.setOnDismissListener(_DismissL(lambda: self._on_dismissed(d)))
+        except Exception as e:
+            log("RichFrog dismiss listener: " + str(e))
+        d.show()
+        self._live.append(d)
+        self._sheet = d
+        self._sheet_wrap = wrap
+        self._has_input = bool(self._pending_input)
+        self._pending_input = False
+        self._kb_poll_id += 1
+        self._kb_t = 0.0
+        if self._has_input and bottom:
+            self._start_kb_poll(wrap)
+        self._sheet_sv = sv
+        self._sheet_bottom = bottom
+
+        # каскад: блоки контента всплывают друг за другом
+        try:
+            base = 0 if had_sheet else 60
+            for i in range(min(8, int(content.getChildCount()))):
+                c = content.getChildAt(i)
+                c.setAlpha(0.0)
+                c.setTranslationY(float(dp(22)))
+                c.animate().setStartDelay(int(base + i * 42)).alpha(1.0).translationY(0.0).setDuration(380).setInterpolator(
+                    emph_dec()).start()
+        except Exception as e:
+            log("RichFrog stagger error: " + str(e))
+
+        def go():
+            try:
+                if bottom:
+                    wrap.animate().setStartDelay(0).translationY(0.0).setDuration(420).setInterpolator(
+                        emph_dec()).setUpdateListener(_AnimUpdate(lambda f: self._sheet_light())).start()
+                    self._dim(w, 0.0, 0.38, 320)
+                else:
+                    wrap.animate().setStartDelay(0).translationX(0.0).setDuration(420).setInterpolator(
+                        emph_dec()).start()
+            except Exception as e:
+                log("RichFrog open anim error: " + str(e))
+                wrap.setTranslationX(0.0)
+                wrap.setTranslationY(0.0)
+
+        if not (bottom and had_sheet):
+            wrap.post(_Runner(go))
+
+    # ==================================================================
+    #  РЕЙТИНГ
+    # ==================================================================
+    @guarded
+    def open_rating(self, view=None):
+        run_on_ui_thread(self._build_rating)
+
+    @guarded
+    def _build_rating(self):
+        errs = []
+
+        class Step(object):
+            def __init__(self, name):
+                self.name = name
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, t, v, tb):
+                if v is not None:
+                    msg = (str(v).strip().splitlines() or [type(v).__name__])[0][:90]
+                    errs.append("%s: %s" % (self.name, msg))
+                    log("RichFrog step %s failed:\n%s" % (self.name, traceback.format_exc()))
+                    return True
+                return False
+
+        ctx = self.activity()
+        C = theme_colors()
+        WHITE = 0xFFFFFFFF - (1 << 32)
+        st = {"level": self.get_level(), "points": self.get_points(),
+              "enabled": self.acc_enabled(), "sel": 0}
+        st["points"] = min(max(st["points"], level_threshold(st["level"])), level_threshold(st["level"] + 1) - 1)
+        refs = {}
+        cells = []     # (paint, label, iv, box)
+        card_cache = {}
+
+        root = LinearLayout(ctx)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(dp(20), dp(24), dp(20), dp(24))
+
+        subtitle = make_text(ctx, "", 17, C["accent"])
+        card_title = make_text(ctx, "", 26, C["text"], True)
+        card_sub = make_text(ctx, "", 18, C["gray"])
+        level_val = make_text(ctx, "", 22, C["accent"])
+        points_val = make_text(ctx, "", 22, C["accent"])
+        range_txt = make_text(ctx, "", 17, C["gray"])
+        badge_holder = FrameLayout(ctx)
+        hs = HorizontalScrollView(ctx)
+
+        with Step("заголовок"):
+            head = FrameLayout(ctx)
+            col = LinearLayout(ctx)
+            col.setOrientation(LinearLayout.VERTICAL)
+            col.addView(make_text(ctx, "Рейтинг профиля", 26, C["text"], True))
+            col.addView(subtitle)
+            head.addView(col, frm(-2, -2, Gravity.LEFT | Gravity.CENTER_VERTICAL))
+            close = make_text(ctx, "✕", 24, C["text"], False, Gravity.CENTER)
+            close.setPadding(dp(12), dp(8), dp(4), dp(8))
+            on_click(close, lambda v: self.close_sheet())
+            head.addView(close, frm(-2, -2, Gravity.RIGHT | Gravity.CENTER_VERTICAL))
+            root.addView(head, lin(-1, -2, None, (0, 0, 0, 16)))
+
+        with Step("карточка"):
+            card = LinearLayout(ctx)
+            card.setOrientation(LinearLayout.HORIZONTAL)
+            card.setGravity(Gravity.CENTER_VERTICAL)
+            set_bg(card, glass(C["card"], 20))
+            card.setPadding(dp(20), dp(18), dp(20), dp(18))
+            card.addView(badge_holder, lin(dp(64), dp(64), None, (0, 0, 16, 0)))
+            ccol = LinearLayout(ctx)
+            ccol.setOrientation(LinearLayout.VERTICAL)
+            ccol.addView(card_title)
+            ccol.addView(card_sub)
+            card.addView(ccol, lin(-2, -2))
+            root.addView(card, lin(-1, -2, None, (0, 0, 0, 20)))
+
+        def build_cell(i):
+            c = cells[i]
+            if c["rc"] is not None:
+                return
+            lv = i + 1
+            color = C["text"] if lv == st["sel"] else C["gray"]
+            box, rc = make_badge_parts(ctx, lv, 44, color, 5.5, None, C["ink"])
+            c["cell"].addView(box, frm(dp(44), dp(44), Gravity.CENTER))
+            if lv == st["sel"]:
+                box.setScaleX(1.18)
+                box.setScaleY(1.18)
+            c["rc"], c["box"] = rc, box
+
+        def build_near(lv):
+            for i in range(max(0, lv - 8), min(MAX_LEVEL, lv + 7)):
+                build_cell(i)
+            order = sorted(range(MAX_LEVEL), key=lambda i: abs(i - (lv - 1)))
+            pos = [0]
+
+            def step():
+                try:
+                    if not strip.isAttachedToWindow():
+                        return
+                    n = 0
+                    while pos[0] < len(order) and n < 10:
+                        build_cell(order[pos[0]])
+                        pos[0] += 1
+                        n += 1
+                    if pos[0] < len(order):
+                        strip.postDelayed(_Runner(step), 28)
+                except Exception as e:
+                    log("RichFrog lazy badges: " + str(e))
+
+            strip.postDelayed(_Runner(step), 60)
+
+        def recolor(idx, color, sel=False):
+            if 0 <= idx < len(cells):
+                build_cell(idx)
+                c = cells[idx]
+                c["rc"](color)
+                sc = 1.18 if sel else 1.0
+                if st.get("drag"):
+                    c["box"].setScaleX(sc)
+                    c["box"].setScaleY(sc)
+                else:
+                    c["box"].animate().setStartDelay(0).scaleX(sc).scaleY(sc).setDuration(180).setInterpolator(
+                        DecelerateInterpolator(1.6)).start()
+
+        def follow(lv, smooth=True):
+            try:
+                wd = int(hs.getWidth())
+                x = max(0, (lv - 1) * dp(60) + dp(30) - (wd // 2 if wd > 0 else dp(150)))
+                if smooth:
+                    hs.smoothScrollTo(int(x), 0)
+                else:
+                    hs.scrollTo(int(x), 0)
+            except Exception:
+                pass
+
+        def refresh(set_sliders=True):
+            lv = st["level"]
+            lo_ = level_threshold(lv)
+            hi_ = level_threshold(lv + 1)
+            st["points"] = min(max(st["points"], lo_), max(lo_, hi_ - 1))
+            set_out(subtitle, "уровень %d · %s очков" % (lv, fmt_k(st["points"])))
+            set_out(card_title, "Уровень %d" % lv)
+            if lv >= MAX_LEVEL:
+                set_out(card_sub, "максимальный уровень")
+            else:
+                set_out(card_sub, "до %d-го: %s очков" % (lv + 1, fmt_k(max(0, hi_ - st["points"]))))
+            set_out(level_val, str(lv))
+            set_out(points_val, fmt_k(st["points"]))
+            set_out(range_txt, "Диапазон Telegram: %s — %s" % (fmt_k(lo_), fmt_k(hi_)))
+            try:
+                if st.get("card_lv") != lv:
+                    badge_holder.removeAllViews()
+                    bv = card_cache.get(lv)
+                    if bv is None:
+                        bv = make_badge(ctx, lv, 64, C["text"], 7.0, None, C["ink"])
+                        card_cache[lv] = bv
+                    par = bv.getParent()
+                    if par is not None:
+                        par.removeView(bv)
+                    badge_holder.addView(bv, frm(dp(64), dp(64)))
+                    if "card_lv" in st and not st.get("drag"):
+                        badge_holder.setScaleX(0.85)
+                        badge_holder.setScaleY(0.85)
+                        badge_holder.animate().scaleX(1.0).scaleY(1.0).setDuration(180).setInterpolator(
+                            DecelerateInterpolator(1.8)).start()
+                    st["card_lv"] = lv
+            except Exception as e:
+                log("RichFrog card badge: " + str(e))
+            if st["sel"] != lv:
+                recolor(st["sel"] - 1, C["gray"], False)
+                recolor(lv - 1, C["text"], True)
+                st["sel"] = lv
+                follow(lv, not st.get("drag"))
+            if set_sliders and "lvl" in refs:
+                refs["lvl"].setProgress(lv - 1)
+                span = max(1, hi_ - 1 - lo_)
+                refs["pts"].setProgress(int(round(1000.0 * (st["points"] - lo_) / span)))
+
+        def scroll_to(lv):
+            follow(lv, False)
+
+        def set_level(n):
+            st["level"] = min(MAX_LEVEL, max(1, n))
+            st["points"] = level_threshold(st["level"])
+            refresh()
+
+        with Step("значки"):
+            lbl = make_text(ctx, "Как выглядит на каждом уровне", 17, C["gray"])
+            root.addView(lbl, lin(-2, -2, None, (0, 0, 0, 12)))
+            hs.setHorizontalScrollBarEnabled(False)
+            strip = LinearLayout(ctx)
+            strip.setOrientation(LinearLayout.HORIZONTAL)
+            hs.addView(strip)
+            st["sel"] = st["level"]
+            for lv in range(1, MAX_LEVEL + 1):
+                cell = FrameLayout(ctx)
+                on_click(cell, (lambda nn: (lambda v: set_level(nn)))(lv))
+                strip.addView(cell, lin(dp(60), dp(56)))
+                cells.append({"cell": cell, "rc": None, "box": None})
+            root.addView(hs, lin(-1, -2, None, (0, 0, 0, 12)))
+            build_near(st["level"])
+
+        def on_level_slider(p):
+            st["level"] = p + 1
+            st["points"] = level_threshold(st["level"])
+            st["drag"] = True
+            try:
+                refresh(False)
+            finally:
+                st["drag"] = False
+            refs["pts"].setProgress(0)
+
+        def on_points_slider(p):
+            lo_ = level_threshold(st["level"])
+            hi_ = level_threshold(st["level"] + 1)
+            span = max(1, hi_ - 1 - lo_)
+            st["points"] = lo_ + int(round(span * p / 1000.0))
+            refresh(False)
+
+        with Step("ползунки"):
+            lrow = FrameLayout(ctx)
+            lrow.addView(make_text(ctx, "Уровень", 22, C["text"]), frm(-2, -2, Gravity.LEFT))
+            lrow.addView(level_val, frm(-2, -2, Gravity.RIGHT))
+            root.addView(lrow, lin(-1, -2, None, (0, 8, 0, 8)))
+            refs["lvl"] = make_slider(ctx, C["accent"], C["track"], MAX_LEVEL - 1, st["level"] - 1, on_level_slider)
+            root.addView(refs["lvl"], lin(-1, dp(40), None, (0, 0, 0, 12)))
+            prow = FrameLayout(ctx)
+            prow.addView(make_text(ctx, "Очки", 22, C["text"]), frm(-2, -2, Gravity.LEFT))
+            prow.addView(points_val, frm(-2, -2, Gravity.RIGHT))
+            root.addView(prow, lin(-1, -2, None, (0, 8, 0, 0)))
+            root.addView(range_txt, lin(-2, -2, None, (0, 0, 0, 6)))
+            lo0 = level_threshold(st["level"])
+            span0 = max(1, level_threshold(st["level"] + 1) - 1 - lo0)
+            refs["pts"] = make_slider(ctx, C["accent"], C["track"], 1000,
+                                      int(round(1000.0 * (st["points"] - lo0) / span0)), on_points_slider)
+            root.addView(refs["pts"], lin(-1, dp(40), None, (0, 0, 0, 20)))
+
+        with Step("кнопки"):
+            def set_enabled(v):
+                st["enabled"] = bool(v)
+
+            root.addView(switch_row(ctx, C, "Показывать в профиле", lambda: st["enabled"], set_enabled),
+                         lin(-1, -2, None, (0, 0, 0, 14)))
+
+            save = make_text(ctx, "Сохранить", 20, WHITE, True, Gravity.CENTER)
+            set_bg(save, accent_pill(C["accent"], 30))
+
+            def do_save(v):
+                self.acc_set("level", str(st["level"]))
+                self.acc_set("points", str(st["points"]))
+                self.acc_set("enabled", st["enabled"])
+                self.close_sheet()
+                self.refresh_profile()
+
+            on_click(save, do_save)
+            root.addView(save, lin(-1, dp(60)))
+
+        with Step("обновление"):
+            refresh()
+
+        self.show_sheet(root, bottom=True, height=0.5)
+        with Step("прокрутка"):
+            hs.post(_Runner(lambda: scroll_to(st["level"])))
+        if errs:
+            log("RichFrog rating opened with errors: " + " | ".join(errs[:3]))
+
+    # ==================================================================
+    #  TL-классы и запросы
+    # ==================================================================
+    def tl(self, *needles, prefix="", exclude=()):
+        key = (needles, prefix, exclude)
+        if key in self._tl_cache:
+            return self._tl_cache[key]
+        from java.lang import Class
+        best = None
+        for outer in TL_OUTERS:
+            try:
+                oc = Class.forName(outer)
+            except Exception:
+                continue
+            try:
+                for c in oc.getDeclaredClasses():
+                    n = str(c.getSimpleName()).lower()
+                    if not n.startswith(prefix):
+                        continue
+                    if c.isInterface() or java_abstract(c):
+                        continue
+                    if all(x in n for x in needles) and not any(e in n for e in exclude):
+                        if best is None or len(n) < len(str(best.getSimpleName())):
+                            best = c
+            except Exception:
+                continue
+        res = jclass(best.getName()) if best is not None else None
+        self._tl_cache[key] = res
+        if best is not None:
+            self._tl_raw[str(best.getName())] = best
+        if res is None:
+            names = []
+            for outer in TL_OUTERS:
+                try:
+                    for c in Class.forName(outer).getDeclaredClasses():
+                        n = str(c.getSimpleName())
+                        if needles[0][:9] in n.lower():
+                            names.append(n)
+                except Exception:
+                    pass
+            log("RichFrog: TL-класс не найден %s, похожие: %s" % (needles, names[:15]))
+            self._tl_diag = "%s -> %s" % (needles[0], ", ".join(names[:8]) or "ничего")
+        return res
+
+    def request(self, req, cb):
+        """cb(response, error) вызывается в UI-потоке."""
+        def wrapper(resp, err):
+            run_on_ui_thread(lambda: guarded(cb)(resp, err))
+        try:
+            from client_utils import send_request
+            send_request(req, wrapper)
+            return
+        except Exception as e:
+            log("RichFrog send_request fallback: " + str(e))
+        from org.telegram.tgnet import ConnectionsManager, RequestDelegate
+        from org.telegram.messenger import UserConfig
+
+        class _D(dynamic_proxy(RequestDelegate)):
+            def run(self, response, error):
+                wrapper(response, error)
+
+        ConnectionsManager.getInstance(UserConfig.selectedAccount).sendRequest(req, _D())
+
+    # ---------- хранилище ----------
+    def _tl_parent(self):
+        best = None
+        for rc in self._tl_raw.values():
+            n = str(rc.getSimpleName()).lower()
+            if "savedstargift" in n and (best is None or len(n) < len(str(best.getSimpleName()))):
+                best = rc
+        if best is not None:
+            try:
+                return jclass(str(best.getSuperclass().getName()))
+            except Exception:
+                return None
+        return None
+
+    def _decode_gift(self, item, saved_cls, parent):
+        """Восстанавливает SavedStarGift из сохранённых байтов. (obj, ошибка)."""
+        from org.telegram.tgnet import SerializedData
+        last_err = None
+        try:
+            data = base64.b64decode(item["b64"])
+        except Exception as e:
+            return None, e
+
+        def mk_sd():
+            try:
+                return SerializedData(data)
+            except Exception:
+                from java import jbyte
+                return SerializedData(jarray(jbyte)([b - 256 if b > 127 else b for b in data]))
+
+        def a1():
+            sd = mk_sd()
+            ctor = sd.readInt32(True)
+            return parent.TLdeserialize(sd, ctor, True)
+
+        def a2():
+            sd = mk_sd()
+            ctor = sd.readInt32(True)
+            return parent.TLdeserialize(sd, ctor, False)
+
+        def a3():
+            sd = mk_sd()
+            sd.readInt32(True)
+            o = saved_cls()
+            o.readParams(sd, True)
+            return o
+
+        def a4():
+            sd = mk_sd()
+            o = saved_cls()
+            o.readParams(sd, True)
+            return o
+
+        def a5():
+            sd = mk_sd()
+            sd.readInt32(True)
+            o = saved_cls()
+            o.readParams(sd, False)
+            return o
+
+        attempts = ([a1, a2] if parent is not None else []) + [a3, a4, a5]
+        for fn in attempts:
+            try:
+                cand = fn()
+                if cand is not None and getattr(cand, "gift", None) is not None:
+                    return cand, None
+            except Exception as e:
+                last_err = e
+        return None, last_err
+
+    def fakes(self):
+        uid = self.uid()
+        if not uid:
+            return []   # аккаунт ещё не поднялся: не кэшируем, попробуем позже
+        if uid in self._fakes:
+            cur = self._fakes[uid]
+            # то, что не удалось прочитать сразу после запуска, пробуем ещё раз
+            bad = self._failed.get(uid)
+            if bad and time.time() - self._retry_t.get(uid, 0.0) > 3.0 and self._retry_n.get(uid, 0) < 30:
+                self._retry_t[uid] = time.time()
+                self._retry_n[uid] = self._retry_n.get(uid, 0) + 1
+                saved_cls = self.tl("savedstargift", exclude=("s_", "get", "collection"))
+                if saved_cls is not None:
+                    parent = self._tl_parent()
+                    still = []
+                    got = 0
+                    for item in bad:
+                        obj, _e = self._decode_gift(item, saved_cls, parent)
+                        if obj is not None:
+                            cur.append((str(item["sid"]), obj, item))
+                            got += 1
+                        else:
+                            still.append(item)
+                    self._failed[uid] = still
+                    if got:
+                        log("RichFrog gifts restored on retry: %d" % got)
+            return cur
+        out = []
+        failed = []
+        try:
+            raw = json.loads(self.acc_get("gifts_json", "[]") or "[]")
+        except Exception:
+            raw = []
+        if not raw:
+            self._fakes[uid] = out
+            self._failed[uid] = []
+            return out
+        saved_cls = self.tl("savedstargift", exclude=("s_", "get", "collection"))
+        if saved_cls is None:
+            return out   # TL-классы ещё не готовы: не кэшируем, попробуем в следующий раз
+        parent = self._tl_parent()
+        last_err = None
+        for item in raw:
+            obj, err = self._decode_gift(item, saved_cls, parent)
+            if obj is not None:
+                out.append((str(item["sid"]), obj, item))
+            else:
+                last_err = err
+                failed.append(item)
+        if failed:
+            log("RichFrog gifts restore failed %d: %s" % (len(failed), last_err))
+            if not self._load_warned and self._retry_n.get(uid, 0) >= 3:
+                self._load_warned = True
+                msg = "RichFrog: не удалось восстановить подарков: %d (%s)" % (len(failed), str(last_err)[:90])
+                run_on_ui_thread(lambda: self.toast(msg))
+        self._fakes[uid] = out
+        self._failed[uid] = failed
+        return out
+
+    def save_fakes(self):
+        items = []
+        for sid, obj, meta in self.fakes():
+            items.append(meta)
+        items.extend(self._failed.get(self.uid(), []))   # нечитаемые подарки не затираем
+        self.acc_set("gifts_json", json.dumps(items))
+
+    # ---------- «ношу» NFT: статус рядом с именем, живёт между заходами ----------
+    def worn_id(self):
+        v = self.acc_get("worn_id", "")
+        try:
+            return int(v) if v else 0
+        except Exception:
+            return 0
+
+    def _refresh_worn_flag(self):
+        any_w = False
+        try:
+            for uid in self._all_uids():
+                if self.get_setting("worn_id_%d" % uid, ""):
+                    any_w = True
+                    break
+        except Exception:
+            any_w = True
+        self._worn_any = any_w
+
+    def fake_unique_by_id(self, cid):
+        try:
+            for sid, obj, meta in self.fakes():
+                g = getattr(obj, "gift", None)
+                if g is not None and hasattr(g, "attributes") and int(g.id) == int(cid):
+                    return g
+        except Exception:
+            pass
+        return None
+
+    def fake_unique_by_slug(self, slug):
+        low = str(slug).lower()
+        try:
+            for sid, obj, meta in self.fakes():
+                g = getattr(obj, "gift", None)
+                if g is not None and str(getattr(g, "slug", "") or "").lower() == low:
+                    return g
+        except Exception:
+            pass
+        return None
+
+    def build_unique_response(self, g):
+        cls = None
+        try:
+            cls = find_class("org.telegram.tgnet.TLRPC$TL_payments_uniqueStarGift")
+        except Exception:
+            cls = None
+        if cls is None:
+            cls = self.tl("payments_uniquestargift", exclude=("get", "value", "resale", "info"))
+        if cls is None:
+            return None
+        from java.util import ArrayList
+        r = cls()
+        r.gift = g
+        r.chats = ArrayList()
+        users = ArrayList()
+        try:
+            from org.telegram.messenger import MessagesController, UserConfig
+            me = MessagesController.getInstance(UserConfig.selectedAccount).getUser(my_id())
+            if me is not None:
+                users.add(me)
+        except Exception:
+            pass
+        r.users = users
+        return r
+
+    def set_worn(self, cid):
+        self._worn_obj.pop(self.uid(), None)
+        self.acc_set("worn_id", str(int(cid)))
+        self._worn_any = True
+
+    def clear_worn(self, strip=False):
+        uid = self.uid()
+        self.acc_set("worn_id", "")
+        ent = self._worn_obj.pop(uid, None)
+        self._refresh_worn_flag()
+        if strip and ent is not None:
+            for user in self._me_users():
+                try:
+                    cur = getattr(user, "emoji_status", None)
+                    if cur is not None and _ih(cur) == _ih(ent[1]):
+                        user.emoji_status = None
+                        user.flags = user.flags & ~512
+                except Exception as e:
+                    log("RichFrog worn strip error: " + str(e))
+
+    def _status_for(self, g):
+        cls = None
+        try:
+            cls = find_class("org.telegram.tgnet.TLRPC$TL_emojiStatusCollectible")
+        except Exception:
+            cls = None
+        if cls is None:
+            cls = self.tl("emojistatuscollectible", exclude=("input", "get", "update"))
+        if cls is None:
+            return None
+        model = pattern = bd = None
+        lst = g.attributes
+        for i in range(int(lst.size())):
+            a = lst.get(i)
+            n = str(a.getClass().getSimpleName()).lower()
+            if "model" in n:
+                model = a
+            elif "pattern" in n:
+                pattern = a
+            elif "backdrop" in n:
+                bd = a
+        s = cls()
+
+        def put(k, v):
+            try:
+                setattr(s, k, v)
+            except Exception as e:
+                log("RichFrog status field %s: %s" % (k, e))
+
+        put("collectible_id", int(g.id))
+        put("title", str(getattr(g, "title", "") or ""))
+        put("slug", str(getattr(g, "slug", "") or ""))
+        if model is not None:
+            put("document_id", int(model.document.id))
+        if pattern is not None:
+            put("pattern_document_id", int(pattern.document.id))
+        if bd is not None:
+            for k in ("center_color", "edge_color", "pattern_color", "text_color"):
+                put(k, int(getattr(bd, k)))
+        return s
+
+    def _worn_status(self):
+        uid = self.uid()
+        wid = self.worn_id()
+        if not wid:
+            return None
+        ent = self._worn_obj.get(uid)
+        if ent is None or ent[0] != wid:
+            g = self.fake_unique_by_id(wid)
+            if g is None:
+                return None
+            s = self._status_for(g)
+            if s is None:
+                return None
+            ent = (wid, s)
+            self._worn_obj[uid] = ent
+        return ent[1]
+
+    def _put_status(self, user, s):
+        cur = getattr(user, "emoji_status", None)
+        if cur is not None and _ih(cur) == _ih(s):
+            return
+        user.emoji_status = s
+        user.flags = user.flags | 512
+
+    def apply_worn(self):
+        """Возвращает надетый NFT в объект своего пользователя (после перезахода в профиль и т.п.)."""
+        if not self._worn_any:
+            return
+        s = self._worn_status()
+        if s is None:
+            return
+        for user in self._me_users():
+            try:
+                self._put_status(user, s)
+            except Exception as e:
+                log("RichFrog worn apply error: " + str(e))
+
+    def apply_worn_to(self, args):
+        s = self._worn_status()
+        if s is None:
+            return
+        me = my_id()
+        flat = []
+        for a in args:
+            flat.append(a)
+            try:
+                if a is not None and not hasattr(a, "emoji_status"):
+                    for x in a:
+                        flat.append(x)
+            except Exception:
+                pass
+        for u in flat:
+            try:
+                if u is not None and hasattr(u, "emoji_status") and int(u.id) == me:
+                    self._put_status(u, s)
+            except Exception:
+                continue
+
+    def notify_status(self):
+        try:
+            from org.telegram.messenger import NotificationCenter, MessagesController, UserConfig
+            acc = UserConfig.selectedAccount
+            try:
+                mask = int(MessagesController.UPDATE_MASK_EMOJI_STATUS)
+            except Exception:
+                mask = int(MessagesController.UPDATE_MASK_ALL)
+            NotificationCenter.getInstance(acc).postNotificationName(NotificationCenter.updateInterfaces, mask)
+        except Exception as e:
+            log("RichFrog notify status: " + str(e))
+
+    def add_fake(self, saved_obj, meta):
+        from org.telegram.tgnet import SerializedData
+        sd = SerializedData()
+        saved_obj.serializeToStream(sd)
+        raw = bytes(sd.toByteArray())
+        sid = str(int(saved_obj.saved_id)) if hasattr(saved_obj, "saved_id") else str(random.getrandbits(48))
+        meta = dict(meta)
+        meta["sid"] = sid
+        meta["b64"] = base64.b64encode(raw).decode("ascii")
+        uid = self.uid()
+        cur = self.fakes()
+        if uid not in self._fakes:
+            raise Exception("подарки ещё загружаются, повтори через секунду")
+        cur.append((sid, saved_obj, meta))
+        self.save_fakes()
+        self._push_to_lists()
+
+    def remove_fake(self, sid):
+        cur = self.fakes()
+        for i, (s, obj, meta) in enumerate(cur):
+            if s == sid:
+                try:
+                    if int(obj.gift.id) == self.worn_id():
+                        self.clear_worn(strip=True)
+                        self.notify_status()
+                except Exception:
+                    pass
+                for lst in list(self._lists):
+                    try:
+                        lst.gifts.remove(obj)
+                    except Exception:
+                        pass
+                del cur[i]
+                break
+        self.save_fakes()
+        self.refresh_profile()
+
+    # ---------- вставка в профиль ----------
+    def inject_into_list(self, glist):
+        if not self.gifts_on():
+            return
+        if not hasattr(glist, "gifts"):
+            return
+        try:
+            if int(glist.dialogId) != my_id():
+                return
+        except Exception:
+            return
+        if glist not in self._lists:
+            self._lists.append(glist)
+            self._lists = self._lists[-6:]
+        gifts = glist.gifts
+        have = set()
+        for i in range(int(gifts.size())):
+            try:
+                have.add(str(int(gifts.get(i).saved_id)))
+            except Exception:
+                pass
+        pos = 0
+        added = 0
+        for sid, obj, meta in self.fakes():
+            if sid in have:
+                continue
+            gifts.add(pos, obj)
+            pos += 1
+            added += 1
+        if added:
+            try:
+                glist.totalCount = int(glist.totalCount) + added
+            except Exception:
+                pass
+
+    def reinject(self, force=False):
+        now = time.time()
+        if not force and now - getattr(self, "_reinj_t", 0.0) < 0.4:
+            return
+        self._reinj_t = now
+        for lst in list(self._lists):
+            try:
+                self.inject_into_list(lst)
+            except Exception:
+                pass
+
+    def _push_to_lists(self):
+        for lst in list(self._lists):
+            try:
+                self.inject_into_list(lst)
+            except Exception:
+                pass
+        self.refresh_profile()
+
+    # ==================================================================
+    #  Картинки (стикеры)
+    # ==================================================================
+    def sticker_view(self, ctx, doc, size_dp, tint=None, static=False):
+        from org.telegram.ui.Components import BackupImageView
+        from org.telegram.messenger import ImageLocation        iv = BackupImageView(ctx)
+        if doc is None:
+            return iv
+        loc = ImageLocation.getForDocument(doc)
+        flt = "%d_%d" % (size_dp, size_dp) + ("_firstframe" if static else "")
+        done = False
+        attempts = []
+        if cast is not None:
+            attempts.append(lambda: iv.setImage(loc, flt, cast(Drawable, None), doc))
+        attempts.append(lambda: iv.setImage(loc, flt, None, doc))
+        for fn in attempts:
+            try:
+                fn()
+                done = True
+                break
+            except Exception:
+                continue
+        if not done:
+            log("RichFrog: не удалось загрузить стикер")
+        if tint is not None:
+            try:
+                iv.getImageReceiver().setColorFilter(PorterDuffColorFilter(signed(tint), PorterDuff.Mode.SRC_IN))
+            except Exception:
+                pass
+        return iv
+
+    def grid_lazy(self, ctx, factories, cols=3, batch=4):
+        """Плитки добавляются порциями, чтобы экран не зависал при открытии."""
+        col = LinearLayout(ctx)
+        col.setOrientation(LinearLayout.VERTICAL)
+        state = {"i": 0}
+        total = len(factories)
+
+        def add_batch():
+            try:
+                if state["i"] > 0 and not col.isAttachedToWindow():
+                    return
+                end = min(total, state["i"] + batch * cols)
+                while state["i"] < end:
+                    i = state["i"]
+                    if i % cols == 0:
+                        row = LinearLayout(ctx)
+                        row.setOrientation(LinearLayout.HORIZONTAL)
+                        col.addView(row, lin(-1, -2))
+                    else:
+                        row = col.getChildAt(col.getChildCount() - 1)
+                    v = factories[i]()
+                    row.addView(v, lin(0, -2, 1, (4, 4, 4, 4)))
+                    try:
+                        v.setAlpha(0.0)
+                        v.setTranslationY(float(dp(16)))
+                        v.animate().alpha(1.0).translationY(0.0).setDuration(240).setStartDelay(
+                            int((i % (batch * cols)) * 24)).start()
+                    except Exception:
+                        pass
+                    state["i"] += 1
+                if state["i"] >= total:
+                    if total % cols:
+                        row = col.getChildAt(col.getChildCount() - 1)
+                        for _ in range(cols - total % cols):
+                            row.addView(View(ctx), lin(0, 1, 1, (4, 4, 4, 4)))
+                    return
+                col.postDelayed(_Runner(add_batch), 40)
+            except Exception as e:
+                log("RichFrog grid error: " + str(e))
+
+        add_batch()
+        return col
+
+    def grid(self, ctx, views, cols=3):
+        col = LinearLayout(ctx)
+        col.setOrientation(LinearLayout.VERTICAL)
+        row = None
+        for i, v in enumerate(views):
+            if i % cols == 0:
+                row = LinearLayout(ctx)
+                row.setOrientation(LinearLayout.HORIZONTAL)
+                col.addView(row, lin(-1, -2))
+            row.addView(v, lin(0, -2, 1, (4, 4, 4, 4)))
+        if views and len(views) % cols:
+            for _ in range(cols - len(views) % cols):
+                row.addView(View(ctx), lin(0, 1, 1, (4, 4, 4, 4)))
+        return col
+
+    def sheet_header(self, ctx, C, title, subtitle=None, left=None, plus=None):
+        head = FrameLayout(ctx)
+        if left is not None:
+            b = arrow_btn(ctx, "left", C["text"], 20)
+            on_click(b, left)
+            head.addView(b, frm(dp(36), dp(36), Gravity.LEFT | Gravity.CENTER_VERTICAL))
+        col = LinearLayout(ctx)
+        col.setOrientation(LinearLayout.VERTICAL)
+        col.addView(make_text(ctx, title, 26, C["text"], True))
+        if subtitle:
+            col.addView(make_text(ctx, subtitle, 16, C["gray"]))
+        head.addView(col, frm(-2, -2, Gravity.LEFT | Gravity.CENTER_VERTICAL, (40 if left is not None else 0, 0, 0, 0)))
+        right = LinearLayout(ctx)
+        right.setOrientation(LinearLayout.HORIZONTAL)
+        if plus is not None:
+            p = make_text(ctx, "+", 32, C["accent"], False, Gravity.CENTER)
+            p.setPadding(dp(10), 0, dp(10), 0)
+            on_click(p, plus)
+            right.addView(p)
+        x = make_text(ctx, "✕", 24, C["text"], False, Gravity.CENTER)
+        x.setPadding(dp(10), 0, dp(2), 0)
+        on_click(x, lambda v: self.close_sheet())
+        right.addView(x)
+        head.addView(right, frm(-2, -2, Gravity.RIGHT | Gravity.CENTER_VERTICAL))
+        return head
+
+    # ==================================================================
+    #  МОИ ПОДАРКИ
+    # ==================================================================
+    @guarded
+    def open_gifts(self, view=None):
+        run_on_ui_thread(self._build_gifts)
+
+    def _gift_attrs(self, gift):
+        """(model, pattern, backdrop) из уникального подарка."""
+        model = pattern = backdrop = None
+        try:
+            attrs = gift.attributes
+            for i in range(int(attrs.size())):
+                a = attrs.get(i)
+                n = str(a.getClass().getSimpleName()).lower()
+                if "model" in n:
+                    model = a
+                elif "pattern" in n:
+                    pattern = a
+                elif "backdrop" in n:
+                    backdrop = a
+        except Exception:
+            pass
+        return model, pattern, backdrop
+
+    @guarded
+    def _build_gifts(self):
+        ctx = self.activity()
+        C = theme_colors()
+        fk = self.fakes()
+        root = LinearLayout(ctx)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(dp(16), dp(22), dp(16), dp(22))
+        root.addView(self.sheet_header(ctx, C, "Мои подарки", plus=lambda v: self.open_catalog()), lin(-1, -2, None, (0, 0, 0, 14)))
+
+        nft = sum(1 for s, o, m in fk if m.get("kind") == "unique")
+        reg = len(fk) - nft
+        card = LinearLayout(ctx)
+        card.setOrientation(LinearLayout.VERTICAL)
+        set_bg(card, glass(C["card"], 20))
+        card.setPadding(dp(20), dp(16), dp(20), dp(16))
+        card.addView(make_text(ctx, "%d подарков" % len(fk), 28, C["text"], True))
+        card.addView(make_text(ctx, "%d NFT · %d обычных" % (nft, reg), 18, C["gray"]))
+        card.addView(make_text(ctx, "%d в профиле" % len(fk), 18, C["accent"]))
+        root.addView(card, lin(-1, -2, None, (0, 0, 0, 14)))
+
+        if not fk:
+            root.addView(make_text(ctx, "Пока пусто. Нажми «+», чтобы добавить подарок.", 17, C["gray"], False, Gravity.CENTER),
+                         lin(-1, -2, None, (0, 24, 0, 24)))
+        facs = [(lambda o=obj, m=meta, i=sid: self._gift_tile(ctx, C, o, m, i)) for sid, obj, meta in fk]
+        self.show_sheet(root, bottom=True, height=0.6)
+        root.addView(self.grid_lazy(ctx, facs), lin(-1, -2))
+
+    def _gift_tile(self, ctx, C, saved, meta, sid):
+        box = FrameLayout(ctx)
+        gift = saved.gift
+        doc = None
+        bg = glass(C["card"], 14)
+        num_txt = None
+        if meta.get("kind") == "unique":
+            model, pattern, backdrop = self._gift_attrs(gift)
+            if backdrop is not None:
+                g = GradientDrawable()
+                g.setGradientType(GradientDrawable.RADIAL_GRADIENT)
+                g.setGradientRadius(float(dp(110)))
+                g.setColors(jarray(jint)([opaque(backdrop.center_color), opaque(backdrop.edge_color)]))
+                g.setCornerRadius(float(dp(14)))
+                bg = g
+            if model is not None:
+                doc = model.document
+            num_txt = "#%d" % int(gift.num)
+        else:
+            doc = getattr(gift, "sticker", None)
+        set_bg(box, bg)
+        box.addView(self.sticker_view(ctx, doc, 80, None, True), frm(dp(80), dp(80), Gravity.CENTER))
+        if num_txt:
+            t = make_text(ctx, num_txt, 11, 0xFFFFFFFF - (1 << 32), True, Gravity.CENTER)
+            t.setPadding(dp(6), dp(2), dp(6), dp(2))
+            t.setBackground(rounded(0x55000000, 8))
+            box.addView(t, frm(-2, -2, Gravity.RIGHT | Gravity.TOP, (0, 6, 6, 0)))
+        box.setMinimumHeight(dp(110))
+        on_click(box, lambda v: self._ask_remove(sid))
+        return box
+
+    @guarded
+    def _ask_remove(self, sid):
+        ctx = self.activity()
+        C = theme_colors()
+        root = LinearLayout(ctx)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(dp(20), dp(26), dp(20), dp(24))
+        root.addView(make_text(ctx, "Убрать из профиля?", 24, C["text"], True), lin(-2, -2, None, (0, 0, 0, 6)))
+        root.addView(make_text(ctx, "Подарок исчезнет из твоего профиля.", 17, C["gray"]), lin(-2, -2, None, (0, 0, 0, 18)))
+        ok = make_text(ctx, "Убрать", 19, 0xFFFFFFFF - (1 << 32), True, Gravity.CENTER)
+        set_bg(ok, accent_pill(C["accent"], 28))
+
+        def do(v):
+            self.remove_fake(sid)
+            self._build_gifts()
+
+        on_click(ok, do)
+        root.addView(ok, lin(-1, dp(56), None, (0, 0, 0, 10)))
+        no = make_text(ctx, "Отмена", 19, C["text"], False, Gravity.CENTER)
+        set_bg(no, glass(C["chip"], 28))
+        on_click(no, lambda v: self._build_gifts())
+        root.addView(no, lin(-1, dp(56)))
+        self.show_sheet(root, bottom=True)
+
+    # ==================================================================
+    #  КАТАЛОГ
+    # ==================================================================
+    @guarded
+    def open_catalog(self):
+        if self.catalog:
+            self._build_catalog()
+            return
+        req_cls = self.tl("getstargifts", exclude=("collection", "saved", "upgrade", "resale", "unique"))
+        if req_cls is None:
+            self.toast("Не найден запрос каталога. " + str(getattr(self, "_tl_diag", "")))
+            return
+        req = req_cls()
+        try:
+            req.hash = 0
+        except Exception:
+            pass
+
+        def done(resp, err):
+            try:
+                if err is not None or resp is None or not hasattr(resp, "gifts"):
+                    self.toast("Не удалось загрузить каталог")
+                    return
+                lst = resp.gifts
+                self.catalog = [lst.get(i) for i in range(int(lst.size())) if hasattr(lst.get(i), "sticker")]
+                self._build_catalog()
+            except Exception as e:
+                log("RichFrog catalog error: " + str(e))
+
+        self.request(req, done)
+
+    @guarded
+    def _build_catalog(self):
+        ctx = self.activity()
+        C = theme_colors()
+        root = LinearLayout(ctx)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(dp(12), dp(22), dp(12), dp(22))
+        root.addView(self.sheet_header(ctx, C, "Каталог NFT", "%d подарков" % len(self.catalog),
+                                       left=lambda v: self.open_gifts()), lin(-1, -2, None, (4, 0, 4, 14)))
+        facs = [(lambda gg=g: self._catalog_tile(ctx, C, gg)) for g in self.catalog]
+        self.show_sheet(root, bottom=True, height=0.6)
+        root.addView(self.grid_lazy(ctx, facs), lin(-1, -2))
+
+    def _catalog_tile(self, ctx, C, g):
+        box = FrameLayout(ctx)
+        set_bg(box, glass(C["card"], 16))
+        box.setMinimumHeight(dp(140))
+        box.addView(self.sticker_view(ctx, getattr(g, "sticker", None), 80, None, True), frm(dp(80), dp(80), Gravity.CENTER_HORIZONTAL | Gravity.TOP, (0, 14, 0, 0)))
+        try:
+            price = int(g.stars)
+        except Exception:
+            price = 0
+        chip = make_text(ctx, "★ {:,}".format(price), 14, 0xFFFFC107 - (1 << 32), True, Gravity.CENTER)
+        chip.setPadding(dp(10), dp(4), dp(10), dp(4))
+        set_bg(chip, glass(C["chip"], 14))
+        box.addView(chip, frm(-2, -2, Gravity.CENTER_HORIZONTAL | Gravity.BOTTOM, (0, 0, 0, 10)))
+        if bool(getattr(g, "limited", False)):
+            r = make_text(ctx, "редкий", 10, 0xFFFFFFFF - (1 << 32), True, Gravity.CENTER)
+            r.setPadding(dp(6), dp(2), dp(6), dp(2))
+            r.setBackground(rounded(0xFFB23A48 - (1 << 32), 8))
+            box.addView(r, frm(-2, -2, Gravity.RIGHT | Gravity.TOP, (0, 6, 6, 0)))
+        on_click(box, lambda v: self.open_editor(g))
+        return box
+
+    # ==================================================================
+    #  РЕДАКТОР ПОДАРКА
+    # ==================================================================
+    def fetch_stats(self, g, cb):
+        """Реальные «выпущено/всего» коллекции: берём уникальный подарок #1 по слагу."""
+        try:
+            gid = int(g.id)
+            if gid in self._stats:
+                cb()
+                return
+            title = str(getattr(g, "title", "") or "")
+            cls = self.tl("getuniquestargift")
+            slug = re.sub(r"[^A-Za-z0-9]", "", title)
+            if cls is None or not slug:
+                cb()
+                return
+            req = cls()
+            req.slug = slug + "-1"
+
+            def done(resp, err):
+                try:
+                    ug = getattr(resp, "gift", None) if (resp is not None and err is None) else None
+                    if ug is not None:
+                        iss = int(getattr(ug, "availability_issued", 0) or 0)
+                        tot = int(getattr(ug, "availability_total", 0) or 0)
+                        if tot > 0:
+                            self._stats[gid] = (iss, tot)
+                except Exception as e:
+                    log("RichFrog stats parse: " + str(e))
+                cb()
+
+            self.request(req, done)
+        except Exception as e:
+            log("RichFrog stats error: " + str(e))
+            cb()
+
+    @guarded
+    def open_editor(self, g):
+        upgrade = 0
+        try:
+            upgrade = int(getattr(g, "upgrade_stars", 0) or 0)
+        except Exception:
+            pass
+        req_cls = self.tl("getstargiftupgradeattributes") or self.tl("getstargiftupgradepreview")
+        if req_cls is None or upgrade <= 0:
+            self.fetch_stats(g, lambda: self._build_editor(g, [], [], []))
+            return
+        req = req_cls()
+        try:
+            req.gift_id = int(g.id)
+        except Exception as e:
+            log("RichFrog gift_id error: " + str(e))
+
+        def done(resp, err):
+            models, patterns, backdrops = [], [], []
+            try:
+                if resp is not None and err is None:
+                    lst = getattr(resp, "attributes", None)
+                    if lst is None:
+                        lst = getattr(resp, "sample_attributes", None)
+                    if lst is not None:
+                        for i in range(int(lst.size())):
+                            a = lst.get(i)
+                            n = str(a.getClass().getSimpleName()).lower()
+                            if "model" in n:
+                                models.append(a)
+                            elif "pattern" in n:
+                                patterns.append(a)
+                            elif "backdrop" in n:
+                                backdrops.append(a)
+            except Exception as e:
+                log("RichFrog attrs error: " + str(e))
+            self.fetch_stats(g, lambda: self._build_editor(g, models, patterns, backdrops))
+
+        self.request(req, done)
+
+    @staticmethod
+    def _rarity(a):
+        try:
+            r = getattr(a, "rarity_permille", None)
+            if r is None:
+                r = getattr(a, "rarity", None)
+            if r is not None and hasattr(r, "permille"):
+                r = r.permille
+            return int(r) if r is not None else None
+        except Exception:
+            return None
+
+    @guarded
+    def _build_editor(self, g, models, patterns, backdrops):
+        ctx = self.activity()
+        C = theme_colors()
+        unique = bool(models and patterns and backdrops)
+        st = {
+            "model": random.choice(models) if models else None,
+            "pattern": random.choice(patterns) if patterns else None,
+            "backdrop": random.choice(backdrops) if backdrops else None,
+            "num": 1, "tab": "model",
+        }
+        title = str(getattr(g, "title", "") or "Подарок")
+
+        root = LinearLayout(ctx)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(dp(14), dp(18), dp(14), dp(22))
+
+        # верхняя строка: назад | [ номер из всего ] | галочка - всё по центру своих мест
+        top = LinearLayout(ctx)
+        top.setOrientation(LinearLayout.HORIZONTAL)
+        top.setGravity(Gravity.CENTER_VERTICAL)
+        back = arrow_btn(ctx, "left", 0xFFFFFFFF, 20)
+        set_bg(back, glass(signed(0x44000000), 21))
+        on_click(back, lambda v: self._build_catalog())
+        top.addView(back, lin(dp(42), dp(42)))
+
+        def num_field(text):
+            e = EditText(ctx)
+            e.setText(text)
+            e.setInputType(InputType.TYPE_CLASS_NUMBER)
+            e.setTextColor(0xFFFFFFFF - (1 << 32))
+            e.setTextSize(19.0)
+            e.setTypeface(Typeface.DEFAULT_BOLD)
+            e.setBackground(None)
+            e.setPadding(0, 0, 0, 0)
+            e.setSingleLine(True)
+            e.setGravity(Gravity.CENTER)
+            e.setMinWidth(dp(22))
+            try:
+                e.setIncludeFontPadding(False)
+            except Exception:
+                pass
+            return e
+
+        num_in = num_field("1")
+        try:
+            rs0 = self._stats.get(int(g.id))
+            tdef = int(rs0[1]) if rs0 else int(getattr(g, "availability_total", 0) or 0)
+        except Exception:
+            tdef = 0
+        total_in = num_field(str(tdef if tdef > 0 else 1000))
+        if unique:
+            iz = make_text(ctx, "из", 15, 0xCCFFFFFF - (1 << 32), False, Gravity.CENTER)
+            try:
+                iz.setIncludeFontPadding(False)
+                iz.setTranslationY(float(dp(1.4)))   # общая базовая линия с цифрами
+            except Exception:
+                pass
+            pill = LinearLayout(ctx)
+            pill.setOrientation(LinearLayout.HORIZONTAL)
+            pill.setGravity(Gravity.CENTER)
+            set_bg(pill, glass(signed(0x44000000), 21))
+            pill.setPadding(dp(12), 0, dp(12), 0)
+            pill.addView(num_in, lin(-2, -1))
+            pill.addView(iz, lin(-2, -1, None, (9, 0, 9, 0)))
+            pill.addView(total_in, lin(-2, -1))
+            top.addView(pill, lin(0, dp(42), 1, (10, 0, 10, 0)))
+        else:
+            top.addView(View(ctx), lin(0, 1, 1))
+        send = arrow_btn(ctx, "check", 0xFFFFFFFF, 20)
+        set_bg(send, glass(signed(0x44000000), 21))
+        top.addView(send, lin(dp(42), dp(42)))
+
+        # превью
+        preview = FrameLayout(ctx)
+        pv_bg = rounded(0xFF1C1C1E - (1 << 32), 22)
+        preview.setBackground(pv_bg)
+        preview.setPadding(dp(14), dp(14), dp(14), dp(14))
+        preview_body = FrameLayout(ctx)
+        preview.addView(preview_body, frm(-1, dp(300)))
+        preview_body.addView(top, frm(-1, -2, Gravity.TOP))
+        art = FrameLayout(ctx)
+        preview_body.addView(art, frm(-1, dp(180), Gravity.TOP, (0, 50, 0, 0)))
+        name_tv = make_text(ctx, title, 26, 0xFFFFFFFF - (1 << 32), True, Gravity.CENTER)
+        sub_tv = make_text(ctx, "Случайные характеристики" if unique else "Обычный подарок", 16, 0xCCFFFFFF - (1 << 32), False, Gravity.CENTER)
+        namebox = LinearLayout(ctx)
+        namebox.setOrientation(LinearLayout.VERTICAL)
+        namebox.addView(name_tv)
+        namebox.addView(sub_tv)
+        preview_body.addView(namebox, frm(-1, -2, Gravity.TOP, (0, 236, 0, 0)))
+
+        chips_row = LinearLayout(ctx)
+        chips_row.setOrientation(LinearLayout.HORIZONTAL)
+        chip_views = {}
+        for key, label in (("model", "модель"), ("backdrop", "фон"), ("pattern", "узор")):
+            cb = LinearLayout(ctx)
+            cb.setOrientation(LinearLayout.VERTICAL)
+            cb.setGravity(Gravity.CENTER)
+            set_bg(cb, glass(signed(0x33000000), 14))
+            cb.setPadding(dp(6), dp(8), dp(6), dp(8))
+            a = make_text(ctx, "", 15, 0xFFFFFFFF - (1 << 32), True, Gravity.CENTER)
+            b_ = make_text(ctx, label, 13, 0xBBFFFFFF - (1 << 32), False, Gravity.CENTER)
+            cb.addView(a)
+            cb.addView(b_)
+            chips_row.addView(cb, lin(0, -2, 1, (3, 0, 3, 0)))
+            chip_views[key] = (cb, a)
+        if unique:
+            root.addView(preview, lin(-1, -2, None, (0, 0, 0, 0)))
+            root.addView(chips_row, lin(-1, -2, None, (0, 10, 0, 10)))
+        else:
+            root.addView(preview, lin(-1, -2, None, (0, 0, 0, 10)))
+
+        tabs = LinearLayout(ctx)
+        tabs.setOrientation(LinearLayout.HORIZONTAL)
+        tab_views = {}
+        options = FrameLayout(ctx)
+
+        POS = [(-95, -35, 26), (95, -35, 26), (-110, 25, 24), (110, 25, 24), (-55, -70, 22),
+               (55, -70, 22), (-60, 70, 24), (60, 70, 24), (0, -85, 20), (0, 90, 20)]
+
+        def paint_preview():
+            art.removeAllViews()
+            art.setAlpha(0.0)
+            art.animate().alpha(1.0).setDuration(180).start()
+            bd = st["backdrop"]
+            if bd is not None:
+                gd = GradientDrawable()
+                gd.setGradientType(GradientDrawable.RADIAL_GRADIENT)
+                gd.setGradientRadius(float(dp(260)))
+                gd.setGradientCenter(0.5, 0.45)
+                gd.setColors(jarray(jint)([opaque(bd.center_color), opaque(bd.edge_color)]))
+                gd.setCornerRadius(float(dp(22)))
+                preview.setBackground(gd)
+                name_tv.setTextColor(opaque(bd.text_color))
+            else:
+                preview.setBackground(pv_bg)
+            if st["pattern"] is not None:
+                tint = opaque(bd.pattern_color) if bd is not None else None
+                for dx, dy, sz in POS:
+                    pv = self.sticker_view(ctx, st["pattern"].document, sz, tint, True)
+                    pv.setAlpha(0.45)
+                    art.addView(pv, frm(dp(sz), dp(sz), Gravity.CENTER, (0, 0, 0, 0)))
+                    pv.setTranslationX(float(dp(dx)))
+                    pv.setTranslationY(float(dp(dy)))
+            doc = st["model"].document if st["model"] is not None else getattr(g, "sticker", None)
+            art.addView(self.sticker_view(ctx, doc, 150), frm(dp(150), dp(150), Gravity.CENTER))
+            for key, (cb, tv) in chip_views.items():
+                a = st[key]
+                if a is not None:
+                    r = self._rarity(a)
+                    set_out(tv, str(getattr(a, "name", "")) + ("  " + fmt_pct(r) if r is not None else ""))
+
+        def pick(key, a):
+            st[key] = a
+            paint_preview()
+            restyle()
+
+        cells = []
+
+        def restyle():
+            for cell, kk, aa in cells:
+                if kk == st["tab"]:
+                    set_bg(cell, self._outlined(C["chip"], C["accent"]) if st[kk] is aa else glass(C["chip"], 14))
+
+        def build_options():
+            options.removeAllViews()
+            del cells[:]
+            for k, (tv, _) in tab_views.items():
+                set_bg(tv, accent_pill(C["accent"], 16) if k == st["tab"] else glass(C["chip"], 16))
+                tv.setTextColor(signed(0xFFFFFFFF if k == st["tab"] else 0xFF8E8E93))
+            key = st["tab"]
+            lst = {"model": models, "backdrop": backdrops, "pattern": patterns}[key]
+            def make_cell(a, key=key):
+                cell = LinearLayout(ctx)
+                cell.setOrientation(LinearLayout.VERTICAL)
+                cell.setGravity(Gravity.CENTER)
+                sel = st[key] is a
+                set_bg(cell, glass(C["chip"], 14))
+                if sel:
+                    set_bg(cell, self._outlined(C["chip"], C["accent"]))
+                cell.setPadding(dp(4), dp(8), dp(4), dp(8))
+                if key == "backdrop":
+                    sw = GradientDrawable()
+                    sw.setGradientType(GradientDrawable.RADIAL_GRADIENT)
+                    sw.setGradientRadius(float(dp(34)))
+                    sw.setColors(jarray(jint)([opaque(a.center_color), opaque(a.edge_color)]))
+                    sw.setShape(GradientDrawable.OVAL)
+                    v = View(ctx)
+                    v.setBackground(sw)
+                    cell.addView(v, lin(dp(56), dp(56)))
+                else:
+                    tint = None
+                    if key == "pattern":
+                        tint = 0xFF8E8E93 if C["dark"] else 0xFF3A3A3C
+                    cell.addView(self.sticker_view(ctx, a.document, 56, tint, True), lin(dp(56), dp(56)))
+                nm = make_text(ctx, str(getattr(a, "name", "")), 12, C["text"], False, Gravity.CENTER)
+                nm.setSingleLine(True)
+                cell.addView(nm)
+                r = self._rarity(a)
+                if r is not None:
+                    cell.addView(make_text(ctx, fmt_pct(r), 11, C["gray"], False, Gravity.CENTER))
+                on_click(cell, (lambda kk, aa: (lambda v: pick(kk, aa)))(key, a))
+                cells.append((cell, key, a))
+                return cell
+
+            options.addView(self.grid_lazy(ctx, [(lambda a=a: make_cell(a)) for a in lst]))
+
+        if unique:
+            for key, label in (("model", "Модели"), ("backdrop", "Фоны"), ("pattern", "Узоры")):
+                tv = make_text(ctx, label, 16, 0xFF8E8E93 - (1 << 32), True, Gravity.CENTER)
+                tv.setPadding(dp(8), dp(10), dp(8), dp(10))
+                tabs.addView(tv, lin(0, -2, 1, (3, 0, 3, 0)))
+                tab_views[key] = (tv, None)
+
+                def mk(kk):
+                    def h(v):
+                        st["tab"] = kk
+                        build_options()
+                    return h
+                on_click(tv, mk(key))
+            root.addView(tabs, lin(-1, -2, None, (0, 0, 0, 8)))
+            root.addView(options, lin(-1, -2))
+            build_options()
+        paint_preview()
+
+        def do_add(v):
+            try:
+                num = max(1, to_int(num_in.getText().toString(), 1)) if unique else 0
+                total = max(num, to_int(total_in.getText().toString(), 1000)) if unique else 0
+                self._add_gift(g, st, num, unique, total)
+                self.open_gifts()
+            except Exception as e:
+                log("RichFrog add error: " + str(e))
+                self.toast("Ошибка добавления: " + str(e))
+
+        on_click(send, do_add)
+        self.show_sheet(root, bottom=True, height=0.6)
+
+    def _outlined(self, fill, stroke):
+        ring = GradientDrawable()
+        ring.setColor(0)
+        ring.setCornerRadius(float(dp(14)))
+        ring.setStroke(dp(2), signed(stroke))
+        return LayerDrawable(jarray(Drawable)([glass(fill, 14), ring]))
+
+    # ---------- сборка подарка ----------
+    def _set_flag(self, obj, bit):
+        try:
+            obj.flags = obj.flags | (1 << bit)
+        except Exception:
+            pass
+
+    def _peer_me(self):
+        pu = find_class("org.telegram.tgnet.TLRPC$TL_peerUser")
+        p = pu()
+        p.user_id = my_id()
+        return p
+
+    def _add_gift(self, g, st, num, unique, total=0):
+        saved_cls = self.tl("savedstargift", exclude=("s_", "get", "collection"))
+        if saved_cls is None:
+            raise Exception("не найден класс SavedStarGift")
+        saved = saved_cls()
+        sid = random.getrandbits(48)
+        if unique:
+            from java.util import ArrayList
+            uq_cls = self.tl("stargiftunique")
+            if uq_cls is None:
+                raise Exception("не найден класс StarGiftUnique")
+            u = uq_cls()
+            title = str(getattr(g, "title", "") or "gift")
+            u.id = random.getrandbits(48)
+            u.gift_id = int(g.id)
+            u.title = title
+            u.slug = (title.replace(" ", "") + "-" + str(num))
+            u.num = int(num)
+            u.owner_id = self._peer_me()
+            self._set_flag(u, 0)
+            lst = ArrayList()
+            lst.add(st["model"])
+            lst.add(st["pattern"])
+            lst.add(st["backdrop"])
+            u.attributes = lst
+            issued = int(num)
+            try:
+                gt = int(getattr(g, "availability_total", 0) or 0)
+                rem = getattr(g, "availability_remains", None)
+                if gt > 0 and rem is not None:
+                    issued = max(issued, gt - int(rem))
+            except Exception:
+                pass
+            rs = self._stats.get(int(g.id))
+            if rs:
+                issued = max(int(rs[0]), int(num))
+                total = max(int(total or 0), int(rs[1]))
+            total = max(int(total or 0), issued)
+            u.availability_issued = issued
+            u.availability_total = total
+            gift = u
+            kind = "unique"
+        else:
+            gift = g
+            kind = "regular"
+        saved.gift = gift
+        saved.date = int(time.time())
+        saved.from_id = self._peer_me()
+        self._set_flag(saved, 1)
+        saved.saved_id = int(sid)
+        self._set_flag(saved, 11)
+        self.add_fake(saved, {"kind": kind, "gid": int(g.id)})
+
+    # ==================================================================
+    #  USERNAME и НОМЕР в профиле (видно только тебе)
+    # ==================================================================
+    def usernames(self):
+        uid = self.uid()
+        c = self._un_cache.get(uid)
+        if c is not None:
+            return list(c)
+        try:
+            raw = json.loads(self.acc_get("usernames_json", "[]") or "[]")
+        except Exception:
+            raw = []
+        c = [x for x in raw if isinstance(x, dict) and x.get("u")]
+        self._un_cache[uid] = c
+        return list(c)
+
+    def save_usernames(self, items):
+        self.acc_set("usernames_json", json.dumps(items))
+        self._refresh_flags()
+
+    def _refresh_flags(self):
+        any_u = False
+        try:
+            for uid in self._all_uids():
+                raw = self.get_setting("usernames_json_%d" % uid, None)
+                if raw and json.loads(raw):
+                    any_u = True
+                    break
+        except Exception:
+            any_u = True
+        self._any_unames = any_u
+
+    def find_username(self, name):
+        low = str(name).lower()
+        for x in self.usernames():
+            if str(x["u"]).lower() == low:
+                return x
+        return None
+
+    def uname_active(self):
+        return str(self.acc_get("uname_active", "") or "")
+
+    def uname_show(self):
+        return bool(self.acc_get("uname_show", True))
+
+    def uname_replace(self):
+        return bool(self.acc_get("uname_replace", True))
+
+    def phones(self):
+        try:
+            raw = json.loads(self.acc_get("phones_json", "[]") or "[]")
+        except Exception:
+            raw = []
+        return [str(x) for x in raw if str(x).isdigit()]
+
+    def save_phones(self, items):
+        self.acc_set("phones_json", json.dumps(items))
+
+    def phone_active(self):
+        return str(self.acc_get("phone_active", "") or "")
+
+    def phone_show(self):
+        return bool(self.acc_get("phone_show", True))
+
+    def _username_cls(self):
+        if getattr(self, "_un_cls", None) is None:
+            cls = None
+            try:
+                cls = find_class("org.telegram.tgnet.TLRPC$TL_username")
+            except Exception:
+                cls = None
+            if cls is None:
+                cls = self.tl("tl_username", exclude=("input", "collect", "update", "check", "get", "reorder", "toggle"))
+            self._un_cls = cls
+        return self._un_cls
+
+    def _me_users(self):
+        from org.telegram.messenger import MessagesController, UserConfig
+        out = []
+        seen = set()
+        acc = UserConfig.selectedAccount
+        cands = []
+        try:
+            cands.append(MessagesController.getInstance(acc).getUser(my_id()))
+        except Exception:
+            pass
+        try:
+            cands.append(UserConfig.getInstance(acc).getCurrentUser())
+        except Exception:
+            pass
+        for u in cands:
+            if u is None:
+                continue
+            h = _ih(u)
+            if h in seen:
+                continue
+            seen.add(h)
+            out.append(u)
+        return out
+
+    def _id_cfg(self, uid):
+        c = self._cfg_cache.get(uid)
+        if c is None:
+            u = self.uname_active() if self.uname_show() else ""
+            if u and self.find_username(u) is None:
+                u = ""
+            p = self.phone_active() if self.phone_show() else ""
+            c = (u, p, self.uname_replace())
+            self._cfg_cache[uid] = c
+        return c
+
+    def apply_identity(self, restore=False, soft=False):
+        """Подмена username/номера в объекте своего пользователя. restore=True возвращает оригиналы.
+        soft=True — вызов из хуков: не чаще раза в 0.2 с, и мгновенный выход, если ничего не настроено."""
+        if soft:
+            now = time.time()
+            if now - self._id_last < 0.2:
+                return
+            self._id_last = now
+        uid = self.uid()
+        if not uid:
+            return
+        want = ("", "", True) if restore else self._id_cfg(uid)
+        if not want[0] and not want[1] and not self._id_dirty:
+            return
+        for user in self._me_users():
+            try:
+                self._apply_one(user, uid, want)
+            except Exception as e:
+                log("RichFrog identity error: " + str(e))
+        self._id_dirty = bool(want[0] or want[1])
+
+    def _quick_ok(self, user, st, wu, wp, replace):
+        if wp and str(getattr(user, "phone", "") or "") != wp:
+            return False
+        if wu:
+            if _ih(user.usernames) != st.get("ul"):
+                return False
+            if replace and str(getattr(user, "username", "") or "") != wu:
+                return False
+        return True
+
+    def _apply_one(self, user, uid, want):
+        wu, wp, replace = want
+        key = (uid, _ih(user))
+        st = self._idstate.get(key)
+        if st is None:
+            if len(self._idstate) > 24:
+                self._idstate.clear()
+            st = {
+                "username": getattr(user, "username", None),
+                "usernames": getattr(user, "usernames", None),
+                "flags": int(getattr(user, "flags", 0)),
+                "flags2": int(getattr(user, "flags2", 0)),
+                "phone": getattr(user, "phone", None),
+            }
+            self._idstate[key] = st
+        sig = (wu, wp, replace)
+        if st.get("sig") == sig and self._quick_ok(user, st, wu, wp, replace):
+            return
+        if wu:
+            self._set_username(user, st, wu, replace)
+            st["ul"] = _ih(user.usernames)
+        else:
+            self._restore_username(user, st)
+        if wp:
+            user.phone = wp
+            user.flags = int(user.flags) | 16
+        else:
+            user.phone = st["phone"]
+            user.flags = (int(user.flags) & ~16) | (st["flags"] & 16)
+        st["sig"] = sig
+
+    def _set_username(self, user, st, name, replace):
+        cls = self._username_cls()
+        if cls is None:
+            return
+
+        def mk(uname, editable, active):
+            t = cls()
+            t.username = uname
+            t.editable = editable
+            t.active = active
+            try:
+                t.flags = (1 if editable else 0) | (2 if active else 0)
+            except Exception:
+                pass
+            return t
+
+        al = jclass("java.util.ArrayList")()
+        al.add(mk(name, False, True))
+        orig = st["usernames"]
+        n = int(orig.size()) if orig is not None else 0
+        if n > 0:
+            for i in range(n):
+                e = orig.get(i)
+                if replace and bool(getattr(e, "editable", False)):
+                    continue
+                if str(e.username).lower() == name.lower():
+                    continue
+                al.add(e)
+        elif st["username"] and not replace:
+            al.add(mk(str(st["username"]), True, True))
+        user.usernames = al
+        if hasattr(user, "flags2"):
+            user.flags2 = int(user.flags2) | 1
+        if replace:
+            user.username = name
+        else:
+            user.username = st["username"]
+        user.flags = int(user.flags) | 8
+
+    def _restore_username(self, user, st):
+        try:
+            user.username = st["username"]
+            user.usernames = st["usernames"]
+            if hasattr(user, "flags2"):
+                user.flags2 = st["flags2"]
+            user.flags = (int(user.flags) & ~8) | (st["flags"] & 8)
+        except Exception as e:
+            log("RichFrog restore username: " + str(e))
+
+    def refresh_identity_ui(self):
+        self.apply_identity()
+        try:
+            from org.telegram.messenger import NotificationCenter, MessagesController, UserConfig
+            acc = UserConfig.selectedAccount
+            Integer = jclass("java.lang.Integer")
+            NotificationCenter.getInstance(acc).postNotificationName(
+                NotificationCenter.updateInterfaces, Integer(int(MessagesController.UPDATE_MASK_ALL)))
+        except Exception as e:
+            log("RichFrog ui refresh: " + str(e))
+        self.refresh_profile()
+
+    def build_collectible_info(self, item):
+        cls = self.tl("collectibleinfo", exclude=("get", "input"))
+        if cls is None:
+            return None
+        r = cls()
+        ton = float(item.get("ton", 10))
+        vals = {
+            "purchase_date": int(item.get("ts", int(time.time()) - 86400 * 90)),
+            "currency": "USD",
+            "amount": int(round(ton * TON_USD * 100)),
+            "crypto_currency": "TON",
+            "crypto_amount": int(round(ton * 1000000000)),
+            "url": "https://fragment.com/username/" + str(item["u"]),
+        }
+        for k, v in vals.items():
+            try:
+                setattr(r, k, v)
+            except Exception as e:
+                log("RichFrog collectible field %s: %s" % (k, e))
+        return r
+
+    # ---------- общие виджеты ----------
+    def _toggle_pill(self, ctx, C, label, getter, setter):
+        return switch_row(ctx, C, label, getter, setter)
+
+    def _input(self, ctx, C, hint, inputtype):
+        self._pending_input = True
+        et = EditText(ctx)
+        et.setHint(hint)
+        et.setTextColor(signed(C["text"]))
+        et.setHintTextColor(signed(C["gray"]))
+        et.setSingleLine(True)
+        et.setTextSize(20.0)
+        et.setInputType(inputtype)
+        et.setPadding(dp(16), dp(14), dp(16), dp(14))
+        set_bg(et, glass(C["chip"], 16))
+
+        def go():
+            try:
+                et.requestFocus()
+                ctx.getSystemService("input_method").showSoftInput(et, 1)
+            except Exception:
+                pass
+
+        et.postDelayed(_Runner(go), 450)
+        return et
+
+    def _two_buttons(self, ctx, C, ok_text, on_ok, on_cancel):
+        row = LinearLayout(ctx)
+        row.setOrientation(LinearLayout.HORIZONTAL)
+        no = make_text(ctx, "Отмена", 19, C["text"], False, Gravity.CENTER)
+        set_bg(no, glass(C["chip"], 28))
+        on_click(no, on_cancel)
+        row.addView(no, lin(0, dp(56), 1, (0, 0, 8, 0)))
+        ok = make_text(ctx, ok_text, 19, WHITE_C, True, Gravity.CENTER)
+        set_bg(ok, accent_pill(C["accent"], 28))
+        on_click(ok, on_ok)
+        row.addView(ok, lin(0, dp(56), 1, (8, 0, 0, 0)))
+        return row
+
+    def _item_card(self, ctx, C, title, sub, active, on_pick, on_del):
+        card = LinearLayout(ctx)
+        card.setOrientation(LinearLayout.HORIZONTAL)
+        card.setGravity(Gravity.CENTER_VERTICAL)
+        set_bg(card, glass(C["card"], 16))
+        card.setPadding(dp(14), dp(8), dp(4), dp(8))
+        col = LinearLayout(ctx)
+        col.setOrientation(LinearLayout.VERTICAL)
+        col.addView(make_text(ctx, title, 18, C["text"], True))
+        col.addView(make_text(ctx, sub, 13, C["accent"] if active else C["gray"]))
+        card.addView(col, lin(0, -2, 1))
+        x = make_text(ctx, "✕", 17, C["gray"], False, Gravity.CENTER)
+        x.setPadding(dp(12), dp(6), dp(10), dp(6))
+        on_click(x, on_del)
+        card.addView(x)
+        on_click(card, on_pick)
+        return card
+
+    # ==================================================================
+    #  USERNAME
+    # ==================================================================
+    @guarded
+    def open_usernames(self, view=None):
+        run_on_ui_thread(self._build_usernames)
+    @guarded
+    def _build_usernames(self):
+        ctx = self.activity()
+        C = theme_colors()
+        items = self.usernames()
+        active = self.uname_active()
+        root = LinearLayout(ctx)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(dp(16), dp(22), dp(16), dp(12))
+        if active and self.uname_show() and self.find_username(active):
+            sub = "в профиле: @%s · %d сохранено" % (active, len(items))
+        else:
+            sub = "скрыт · %d сохранено" % len(items)
+        root.addView(self.sheet_header(ctx, C, "Мои юзернеймы", sub, plus=lambda v: self._build_username_add()),
+                     lin(-1, -2, None, (0, 0, 0, 12)))
+        root.addView(make_text(ctx, "Нажми на карточку, чтобы поставить её в профиль", 14, C["gray"]),
+                     lin(-2, -2, None, (0, 0, 0, 8)))
+
+        def set_show(v):
+            self.acc_set("uname_show", bool(v))
+            self.refresh_identity_ui()
+
+        def set_replace(v):
+            self.acc_set("uname_replace", bool(v))
+            self.refresh_identity_ui()
+
+        root.addView(self._toggle_pill(ctx, C, "Показывать в профиле", self.uname_show, set_show),
+                     lin(-1, -2, None, (0, 0, 0, 6)))
+        root.addView(self._toggle_pill(ctx, C, "Заменять оригинальный", self.uname_replace, set_replace),
+                     lin(-1, -2, None, (0, 0, 0, 10)))
+
+        if not items:
+            root.addView(make_text(ctx, "Пока пусто", 22, C["gray"], True, Gravity.CENTER), lin(-1, -2, None, (0, 22, 0, 4)))
+            root.addView(make_text(ctx, "Добавь первый username кнопкой +", 17, C["gray"], False, Gravity.CENTER),
+                         lin(-1, -2, None, (0, 0, 0, 22)))
+        for it in items:
+            name = str(it["u"])
+            is_act = name.lower() == active.lower()
+            date = time.strftime("%d.%m.%Y", time.localtime(int(it.get("ts", 0)))) if it.get("ts") else ""
+            sub2 = ("● в профиле · " if is_act else "") + "куплен за %g TON%s" % (float(it.get("ton", 10)), (" · " + date) if date else "")
+            root.addView(self._item_card(
+                ctx, C, "@" + name, sub2, is_act,
+                (lambda n=name: (lambda v: self._pick_username(n)))(),
+                (lambda n=name: (lambda v: self._del_username(n)))()),
+                lin(-1, -2, None, (0, 0, 0, 6)))
+        self.show_sheet(root, bottom=True, max_height=0.86)
+
+    def _pick_username(self, name):
+        self.acc_set("uname_active", name)
+        self.acc_set("uname_show", True)
+        self.refresh_identity_ui()
+        self._build_usernames()
+
+    def _del_username(self, name):
+        items = [x for x in self.usernames() if str(x["u"]).lower() != name.lower()]
+        self.save_usernames(items)
+        if self.uname_active().lower() == name.lower():
+            self.acc_set("uname_active", str(items[0]["u"]) if items else "")
+        self.refresh_identity_ui()
+        self._build_usernames()
+
+    @guarded
+    def _build_username_add(self):
+        ctx = self.activity()
+        C = theme_colors()
+        root = LinearLayout(ctx)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(dp(20), dp(26), dp(20), dp(24))
+        root.addView(make_text(ctx, "Username (без @)", 24, C["text"], True), lin(-2, -2, None, (0, 0, 0, 6)))
+        root.addView(make_text(ctx, "Латиница, цифры и _ · от 4 символов. Появится в профиле как купленный за 10 TON.", 15, C["gray"]),
+                     lin(-2, -2, None, (0, 0, 0, 14)))
+        et = self._input(ctx, C, "username", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS)
+        root.addView(et, lin(-1, -2, None, (0, 0, 0, 20)))
+
+        def save(v):
+            name = str(et.getText()).strip().lstrip("@")
+            if not USERNAME_RE.match(name):
+                self.toast("Username: 4–32 символа, латиница, цифры и _, первая — буква")
+                return
+            if self.find_username(name) is not None:
+                self.toast("Такой username уже добавлен")
+                return
+            items = self.usernames()
+            items.append({"u": name, "ton": 10, "ts": int(time.time()) - random.randint(30 * 86400, 700 * 86400)})
+            self.save_usernames(items)
+            self.acc_set("uname_active", name)
+            self.acc_set("uname_show", True)
+            self.refresh_identity_ui()
+            self._build_usernames()
+
+        root.addView(self._two_buttons(ctx, C, "Сохранить", save, lambda v: self._build_usernames()))
+        self.show_sheet(root, bottom=True)
+
+    # ==================================================================
+    #  НОМЕР
+    # ==================================================================
+    @guarded
+    def open_numbers(self, view=None):
+        run_on_ui_thread(self._build_numbers)
+
+    @guarded
+    def _build_numbers(self):
+        ctx = self.activity()
+        C = theme_colors()
+        items = self.phones()
+        active = self.phone_active()
+        root = LinearLayout(ctx)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(dp(16), dp(22), dp(16), dp(12))
+        shown = bool(active and self.phone_show())
+        sub = ("в профиле · %d сохранено" if shown else "скрыт · %d сохранено") % len(items)
+        root.addView(self.sheet_header(ctx, C, "Мой номер " + (fmt_phone(active).split(" ")[0] if active else "+888"), sub,
+                                       plus=lambda v: self._build_number_add()),
+                     lin(-1, -2, None, (0, 0, 0, 12)))
+
+        cur = LinearLayout(ctx)
+        cur.setOrientation(LinearLayout.VERTICAL)
+        set_bg(cur, glass(C["card"], 20))
+        cur.setPadding(dp(16), dp(10), dp(16), dp(10))
+        cur.addView(make_text(ctx, fmt_phone(active) if active else "Номер не задан", 20, C["text"], True))
+        cur.addView(make_text(ctx, "Показывается вместо основного" if active else "Добавь номер кнопкой +", 14, C["gray"]))
+        root.addView(cur, lin(-1, -2, None, (0, 0, 0, 8)))
+
+        def set_show(v):
+            self.acc_set("phone_show", bool(v))
+            self.refresh_identity_ui()
+
+        root.addView(self._toggle_pill(ctx, C, "Показывать в профиле", self.phone_show, set_show),
+                     lin(-1, -2, None, (0, 0, 0, 10)))
+
+        root.addView(make_text(ctx, "Сохранённые номера", 15, C["gray"]), lin(-2, -2, None, (0, 0, 0, 6)))
+        if not items:
+            root.addView(make_text(ctx, "Пока пусто — добавь номер кнопкой +", 16, C["gray"]), lin(-2, -2, None, (0, 0, 0, 14)))
+        for d in items:
+            is_act = d == active
+            root.addView(self._item_card(
+                ctx, C, fmt_phone(d), "● в профиле" if is_act else "нажми, чтобы поставить", is_act,
+                (lambda n=d: (lambda v: self._pick_number(n)))(),
+                (lambda n=d: (lambda v: self._del_number(n)))()),
+                lin(-1, -2, None, (0, 0, 0, 6)))
+
+        frag = make_text(ctx, "Как на Fragment · случайный +888", 16, C["text"], True, Gravity.CENTER)
+        set_bg(frag, glass(C["chip"], 22))
+        on_click(frag, lambda v: self._random_number())
+        root.addView(frag, lin(-1, dp(46), None, (0, 4, 0, 0)))
+        self.show_sheet(root, bottom=True, max_height=0.86)
+
+    def _add_number(self, d):
+        items = self.phones()
+        if d not in items:
+            items.append(d)
+            self.save_phones(items)
+        self.acc_set("phone_active", d)
+        self.acc_set("phone_show", True)
+        self.refresh_identity_ui()
+
+    def _pick_number(self, d):
+        self.acc_set("phone_active", d)
+        self.acc_set("phone_show", True)
+        self.refresh_identity_ui()
+        self._build_numbers()
+
+    def _del_number(self, d):
+        items = [x for x in self.phones() if x != d]
+        self.save_phones(items)
+        if self.phone_active() == d:
+            self.acc_set("phone_active", items[0] if items else "")
+        self.refresh_identity_ui()
+        self._build_numbers()
+
+    def _random_number(self):
+        d = "888" + "".join(str(random.randint(0, 9)) for _ in range(8))
+        self._add_number(d)
+        self._build_numbers()
+
+    @guarded
+    def _build_number_add(self):
+        ctx = self.activity()
+        C = theme_colors()
+        root = LinearLayout(ctx)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(dp(20), dp(26), dp(20), dp(24))
+        root.addView(make_text(ctx, "Номер (например +888 0413 6929)", 24, C["text"], True), lin(-2, -2, None, (0, 0, 0, 14)))
+        et = self._input(ctx, C, "+888", InputType.TYPE_CLASS_PHONE)
+        root.addView(et, lin(-1, -2, None, (0, 0, 0, 20)))
+
+        def save(v):
+            d = clean_phone(str(et.getText()))
+            if len(d) < 8 or len(d) > 15:
+                self.toast("Номер: от 8 до 15 цифр, например +88897637474")
+                return
+            self._add_number(d)
+            self._build_numbers()
+
+        root.addView(self._two_buttons(ctx, C, "Сохранить", save, lambda v: self._build_numbers()))
+        self.show_sheet(root, bottom=True)
+
+    # ==================================================================
+    #  РЕЗЕРВНАЯ КОПИЯ
+    # ==================================================================
+    def _all_uids(self):
+        out = []
+        try:
+            from org.telegram.messenger import UserConfig
+            for acc in range(int(UserConfig.MAX_ACCOUNT_COUNT)):
+                try:
+                    u = UserConfig.getInstance(acc)
+                    if u.isClientActivated():
+                        out.append(int(u.getClientUserId()))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        cur = self.uid()
+        if cur and cur not in out:
+            out.append(cur)
+        return out
+
+    def backup_data(self):
+        data = {"app": "RichFrog", "v": 1, "time": int(time.time()), "accounts": {}}
+        for uid in self._all_uids():
+            acc = {}
+            for k in BACKUP_KEYS:
+                v = self.get_setting("%s_%d" % (k, uid), None)
+                if v is not None:
+                    acc[k] = v
+            if acc:
+                data["accounts"][str(uid)] = acc
+        return data
+
+    def _backup_paths(self):
+        paths = []
+        try:
+            from org.telegram.messenger import ApplicationLoader
+            d = ApplicationLoader.applicationContext.getExternalFilesDir(None)
+            if d is not None:
+                paths.append(str(d.getAbsolutePath()) + "/RichFrog/backup.json")
+        except Exception:
+            pass
+        try:
+            from android.os import Environment
+            d = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            paths.append(str(d.getAbsolutePath()) + "/RichFrog_backup.json")
+        except Exception:
+            pass
+        return paths
+
+    def write_backup(self):
+        text = json.dumps(self.backup_data(), ensure_ascii=False)
+        ok = []
+        for p in self._backup_paths():
+            try:
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(text)
+                ok.append(p)
+            except Exception as e:
+                log("RichFrog backup write %s: %s" % (p, e))
+        return ok
+
+    def read_backup(self):
+        best = None
+        for p in self._backup_paths():
+            try:
+                if not os.path.exists(p):
+                    continue
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.loads(f.read())
+                if isinstance(data, dict) and data.get("app") == "RichFrog":
+                    if best is None or int(data.get("time", 0)) > int(best.get("time", 0)):
+                        best = data
+            except Exception as e:
+                log("RichFrog backup read %s: %s" % (p, e))
+        return best
+
+    def restore_backup(self, data):
+        n = 0
+        if not isinstance(data, dict) or data.get("app") != "RichFrog":
+            return 0
+        self._restoring = True
+        try:
+            for uid, acc in (data.get("accounts") or {}).items():
+                for k, v in acc.items():
+                    if k in BACKUP_KEYS:
+                        self.set_setting("%s_%s" % (k, uid), v)
+                        n += 1
+            self.set_setting("legacy_migrated", True)
+        finally:
+            self._restoring = False
+        self._cfg_cache.clear()
+        self._un_cache.clear()
+        self._refresh_flags()
+        self._fakes = {}
+        self._failed = {}
+        self._load_warned = False
+        self._worn_obj = {}
+        self._refresh_worn_flag()
+        self._bumped = {}
+        try:
+            self.refresh_identity_ui()
+            self._push_to_lists()
+        except Exception as e:
+            log("RichFrog restore refresh: " + str(e))
+        return n
+
+    def _auto_backup(self, now=False):
+        if getattr(self, "_restoring", False):
+            return
+        if now:
+            try:
+                if self.get_setting("auto_backup", True):
+                    self.write_backup()
+            except Exception as e:
+                log("RichFrog auto backup: " + str(e))
+            return
+        if self._bk_pending:
+            return
+        self._bk_pending = True
+
+        def run():
+            try:
+                time.sleep(2.5)
+                self._bk_pending = False
+                self._auto_backup(True)
+            except Exception as e:
+                self._bk_pending = False
+                log("RichFrog backup thread: " + str(e))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _maybe_auto_restore(self):
+        try:
+            if self.get_setting("initialized", False):
+                return
+            self.set_setting("initialized", True)
+            data = self.read_backup()
+            if data and self.restore_backup(data):
+                run_on_ui_thread(lambda: self.toast("RichFrog: настройки восстановлены из копии"))
+        except Exception as e:
+            log("RichFrog auto restore: " + str(e))
+
+    def _clip_set(self, text):
+        from android.content import ClipData
+        self.activity().getSystemService("clipboard").setPrimaryClip(ClipData.newPlainText("RichFrog", text))
+
+    def _clip_get(self):
+        ctx = self.activity()
+        clip = ctx.getSystemService("clipboard").getPrimaryClip()
+        if clip is None or clip.getItemCount() < 1:
+            return ""
+        return str(clip.getItemAt(0).coerceToText(ctx))
+
+    @guarded
+    def open_backup(self, view=None):
+        run_on_ui_thread(self._build_backup)
+
+    @guarded
+    def _build_backup(self):
+        ctx = self.activity()
+        C = theme_colors()
+        root = LinearLayout(ctx)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(dp(16), dp(22), dp(16), dp(22))
+        root.addView(self.sheet_header(ctx, C, "Резервная копия", "настройки переживут удаление плагина"),
+                     lin(-1, -2, None, (0, 0, 0, 14)))
+        info = LinearLayout(ctx)
+        info.setOrientation(LinearLayout.VERTICAL)
+        set_bg(info, glass(C["card"], 20))
+        info.setPadding(dp(20), dp(16), dp(20), dp(16))
+        existing = self.read_backup()
+        if existing:
+            info.addView(make_text(ctx, "Копия есть", 24, C["text"], True))
+            info.addView(make_text(ctx, "от " + time.strftime("%d.%m.%Y %H:%M", time.localtime(int(existing.get("time", 0)))), 16, C["gray"]))
+        else:
+            info.addView(make_text(ctx, "Копии пока нет", 24, C["text"], True))
+            info.addView(make_text(ctx, "Нажми «Создать копию»", 16, C["gray"]))
+        info.addView(make_text(ctx, "В копии: рейтинг, подарки, username, номера", 15, C["gray"]), lin(-2, -2, None, (0, 6, 0, 0)))
+        root.addView(info, lin(-1, -2, None, (0, 0, 0, 12)))
+
+        def set_auto(v):
+            self.set_setting("auto_backup", bool(v))
+
+        root.addView(self._toggle_pill(ctx, C, "Автокопия", lambda: bool(self.get_setting("auto_backup", True)), set_auto),
+                     lin(-2, -2, None, (0, 0, 0, 14)))
+
+        def make():
+            ok = self.write_backup()
+            self.toast("Копия сохранена" if ok else "Не удалось сохранить копию")
+            self._build_backup()
+
+        def restore_file():
+            data = self.read_backup()
+            if not data:
+                self.toast("Файл копии не найден")
+                return
+            n = self.restore_backup(data)
+            self.toast("Восстановлено настроек: %d" % n if n else "В копии нет данных")
+            self._build_backup()
+
+        def to_clip():
+            self._clip_set(json.dumps(self.backup_data(), ensure_ascii=False))
+            self.toast("Копия скопирована в буфер — сохрани её, например, в «Избранное»")
+
+        def from_clip():
+            try:
+                data = json.loads(self._clip_get())
+            except Exception:
+                data = None
+            n = self.restore_backup(data) if data else 0
+            self.toast("Восстановлено настроек: %d" % n if n else "В буфере нет копии RichFrog")
+            self._build_backup()
+
+        btn = make_text(ctx, "Создать копию", 20, WHITE_C, True, Gravity.CENTER)
+        set_bg(btn, accent_pill(C["accent"], 30))
+        on_click(btn, lambda v: make())
+        root.addView(btn, lin(-1, dp(58), None, (0, 0, 0, 10)))
+        for label, fn in (("Восстановить из копии", restore_file),
+                          ("Скопировать копию в буфер", to_clip),
+                          ("Вставить копию из буфера", from_clip)):
+            b = make_text(ctx, label, 18, C["text"], False, Gravity.CENTER)
+            set_bg(b, glass(C["chip"], 28))
+            on_click(b, (lambda f: (lambda v: f()))(fn))
+            root.addView(b, lin(-1, dp(54), None, (0, 0, 0, 10)))
+        root.addView(make_text(ctx, "После переустановки плагина настройки вернутся сами. Если нет — нажми «Восстановить из копии».", 14, C["gray"]),
+                     lin(-2, -2, None, (0, 4, 0, 0)))
+        self.show_sheet(root, bottom=True, max_height=0.86)
+
+    def on_plugin_unload(self):
+        try:
+            self._kill_stale()
+            self._dismiss_now()
+        except Exception:
+            pass
+        try:
+            if self.menu_item_id:
+                self.remove_menu_item(self.menu_item_id)
+                self.menu_item_id = None
+        except Exception:
+            pass
+        try:
+            self.apply_identity(restore=True)
+        except Exception:
+            pass
+        self._auto_backup(True)
+
+    # ==================================================================
+    #  Поддержка
+    # ==================================================================
+    def _start(self, intent):
+        from android.content import Intent
+        from org.telegram.messenger import ApplicationLoader
+        ctx = ApplicationLoader.applicationContext
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        ctx.startActivity(intent)
+
+    def open_contact(self, view=None):
+        try:
+            from android.content import Intent
+            from android.net import Uri
+            from org.telegram.messenger import ApplicationLoader
+            ctx = ApplicationLoader.applicationContext
+            intent = Intent(Intent.ACTION_VIEW, Uri.parse("tg://resolve?domain=Meapia"))
+            intent.setPackage(ctx.getPackageName())
+            self._start(intent)
+        except Exception as e:
+            log("RichFrog open contact error: " + str(e))
+            try:
+                from org.telegram.messenger import Browser
+                Browser.openUrl(get_last_fragment().getParentActivity(), CONTACT_URL)
+            except Exception as e2:
+                log("RichFrog open contact fallback error: " + str(e2))
+
+    def open_wallet(self, view=None):
+        try:
+            from urllib.parse import quote
+            from android.content import Intent
+            from android.net import Uri
+            from org.telegram.messenger import ApplicationLoader
+            ctx = ApplicationLoader.applicationContext
+            url = "ton://transfer/%s?text=%s" % (TON_ADDRESS, quote(TON_COMMENT))
+            intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            count = ctx.getPackageManager().queryIntentActivities(intent, 0).size()
+            if count == 0:
+                web = "https://app.tonkeeper.com/transfer/%s?text=%s" % (TON_ADDRESS, quote(TON_COMMENT))
+                self._start(Intent(Intent.ACTION_VIEW, Uri.parse(web)))
+            elif count == 1:
+                self._start(intent)
+            else:
+                self._start(Intent.createChooser(intent, "Выберите кошелёк"))
+        except Exception as e:
+            log("RichFrog open wallet error: " + str(e))
+
+    # ==================================================================
+    #  Настройки
+    # ==================================================================
+    def create_settings(self):
+        self._migrate()
+        uid = self.uid()
+        n = 0
+        try:
+            n = len(self.fakes())
+        except Exception:
+            pass
+        return [
+            Header(text="NFT-профиль"),
+            Switch(key="enabled_%d" % uid, text="Подмена рейтинга", default=True,
+                   subtext="Только для этого аккаунта · видно только тебе"),
+            Text(
+                text="Рейтинг профиля: ур. %d · %s" % (self.get_level(), fmt_k(self.get_points())),
+                icon="msg_stars", accent=True, on_click=self.open_rating,
+            ),
+            Divider(),
+            Header(text="Подарки"),
+            Switch(key="gifts_enabled_%d" % uid, text="Показывать мои подарки", default=True,
+                   subtext="Подарки хранятся отдельно для каждого аккаунта"),
+            Text(text="Мои подарки (%d)" % n, icon="msg_gift", accent=True, on_click=self.open_gifts),
+            Divider(),
+            Header(text="Профиль"),
+            Text(text="Username (NFT)", icon="msg_edit", accent=True, on_click=self.open_usernames),
+            Text(text="Анонимный номер", icon="msg_calls", accent=True, on_click=self.open_numbers),
+            Divider(),
+            Header(text="Резервная копия"),
+            Text(text="Резервная копия настроек", icon="msg_saved", accent=True, on_click=self.open_backup),
+            Divider(),
+            Header(text="Поддержка проекта"),
+            Text(text="Gram Wallet (TON)", icon="msg_ton", accent=True, on_click=self.open_wallet),
+            Divider(),
+            Header(text="Создатель"),
+            Text(text="@Meapia", icon="msg_contacts", accent=True, on_click=self.open_contact),
+        ]
+
+
+class _Runner(dynamic_proxy(jclass("java.lang.Runnable"))):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def run(self):
+        try:
+            self.fn()
+        except Exception as e:
+            log("RichFrog runner error: " + str(e))
